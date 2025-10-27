@@ -1,6 +1,8 @@
 import pygame
+import math
 import random
 import opensimplex
+import hashlib
 import sys
 import os
 
@@ -25,10 +27,11 @@ DARK_GRAY = (150, 150, 150)
 clock = pygame.time.Clock()
 
 # === PLAYER ===
-player_size = 50
+player_size = 80
 player_x = WIDTH // 2
 player_y = HEIGHT // 2
 player_speed = 5
+player_texture = pygame.transform.scale(pygame.image.load(os.path.join("other", "character.png")), (player_size, player_size))
 
 # === TILE SETTINGS ===
 TILE_SIZE = 100
@@ -49,17 +52,48 @@ for key in TILE_IMAGES:
     TILE_IMAGES[key] = pygame.transform.scale(TILE_IMAGES[key], (TILE_SIZE, TILE_SIZE))
 
 CHUNK_SIZE = 16
+WORLD_SEED = 9999
 world_chunks = {}
+items = []
+
+def generate_item(tile_type, x, y):
+    """Generate a deterministic item for a given tile (x,y) and tile type."""
+    h = float(int(hashlib.md5(f"{x},{y},{WORLD_SEED}".encode()).hexdigest(), 16) % 100) / 100.0
+    
+    if tile_type == "grass":
+        if h < 0.04:
+            return {"type": "rattan", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+        elif h < 0.06:
+            return {"type": "cotton_plant", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+        elif h < 0.1:
+            return {"type": "stick", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+
+    elif tile_type == "dirt":
+        if h < 0.02:
+            return {"type": "limestone", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+        elif h < 0.06:
+            return {"type": "magnesite", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+
+    elif tile_type == "sand":
+        if h < 0.04:
+            return {"type": "rock", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+        elif h < 0.06:
+            return {"type": "clam", "x": x * TILE_SIZE, "y": y * TILE_SIZE}
+
+    return None
 
 def generate_chunk(cx, cy):
-    """Generate a single chunk of terrain."""
-    opns = opensimplex.OpenSimplex(9999)
+    """Generate a single chunk of terrain and spawn items into global items list."""
+    opns = opensimplex.OpenSimplex(WORLD_SEED)
     chunk_tiles = []
+
     for ty in range(CHUNK_SIZE):
         row = []
         for tx in range(CHUNK_SIZE):
-            r = opns.noise2((cx * CHUNK_SIZE + tx)/20,
-                             (cy * CHUNK_SIZE + ty)/20) / 2 + 1
+            world_x = cx * CHUNK_SIZE + tx
+            world_y = cy * CHUNK_SIZE + ty
+            r = opns.noise2(world_x / 20, world_y / 20) / 2 + 1
+
             if r < 0.735:
                 tile = "grass"
             elif r < 0.75:
@@ -70,12 +104,19 @@ def generate_chunk(cx, cy):
                 tile = "water"
             else:
                 tile = "water"
+
             row.append(tile)
+
+            # === Generate item directly into global items list ===
+            item = generate_item(tile, world_x, world_y)
+            if item:
+                items.append(item)
+
         chunk_tiles.append(row)
+
     return chunk_tiles
 
 def get_chunk(cx, cy):
-    """Return chunk if loaded, or generate it."""
     if (cx, cy) not in world_chunks:
         world_chunks[(cx, cy)] = generate_chunk(cx, cy)
     return world_chunks[(cx, cy)]
@@ -133,6 +174,8 @@ ITEM_IMAGES = {
     "stone_axe": pygame.image.load(os.path.join(RESOURCE_PATH, "stone_axe.png")),
     "burning_cotton_boll": pygame.image.load(os.path.join(RESOURCE_PATH, "burning_cotton_boll.png")),
     "ashes": pygame.image.load(os.path.join(RESOURCE_PATH, "ashes.png")),
+    "wood_dust": pygame.image.load(os.path.join(RESOURCE_PATH, "wood_dust.png")),
+    "burning_wood_dust": pygame.image.load(os.path.join(RESOURCE_PATH, "burning_wood_dust.png")),
 }
 
 MAX_ITEM_DUR = {
@@ -144,7 +187,13 @@ MAX_ITEM_DUR = {
 }
 
 ITEM_CONVERT = {
-    "burning_cotton_boll": [5, "ashes"],
+    "burning_cotton_boll": [5, None],
+    "burning_wood_dust": [10, "ashes"],
+}
+
+ITEM_CONVERT_LABELS = {
+    "burning_cotton_boll": "Burns in: ",
+    "wood_dust": "Burns in: ",
 }
 
 ITEM_SIZE = 40
@@ -165,7 +214,7 @@ def spawn_items(num=30):
         items.append(item)
     return items
 
-items = spawn_items()
+#items.extend(spawn_items())
 
 # === INVENTORY ===
 inventory = [None, None]
@@ -354,9 +403,18 @@ def draw_crafting_gui():
         pygame.draw.rect(WIN, LIGHT_GRAY, rect)
         pygame.draw.rect(WIN, BLACK, rect, 2)
         if craft_slots[i]:
-            img = ITEM_IMAGES[craft_slots[i]["type"]]
+            item = craft_slots[i]
+            img = ITEM_IMAGES[item["type"]]
             img_rect = img.get_rect(center=rect.center)
             WIN.blit(img, img_rect)
+
+            # === Durability bar (for tools) ===
+            if "dur" in item:
+                max_dur = MAX_ITEM_DUR[item["type"]]
+                dur_ratio = item["dur"] / max_dur
+                bar_width = int(rect.width * dur_ratio)
+                pygame.draw.rect(WIN, (0, 200, 0), (rect.x, rect.bottom - 6, bar_width, 5))
+                pygame.draw.rect(WIN, BLACK, (rect.x, rect.bottom - 6, rect.width, 5), 1)
 
     # Draw arrow
     draw_arrow()
@@ -369,6 +427,14 @@ def draw_crafting_gui():
         img = ITEM_IMAGES[out["item"]]
         img_rect = img.get_rect(center=rect.center)
         WIN.blit(img, img_rect)
+
+        # === Durability bar for crafted items (if any) ===
+        if out["item"] in MAX_ITEM_DUR:
+            max_dur = MAX_ITEM_DUR[out["item"]]
+            dur_ratio = 1.0  # crafted items start full
+            bar_width = int(rect.width * dur_ratio)
+            pygame.draw.rect(WIN, (0, 200, 0), (rect.x, rect.bottom - 6, bar_width, 5))
+            pygame.draw.rect(WIN, BLACK, (rect.x, rect.bottom - 6, rect.width, 5), 1)
 
 # === MAIN LOOP ===
 running = True
@@ -497,11 +563,14 @@ while running:
         if item["type"] in ITEM_CONVERT:
             item["timer"] = item.get("timer", ITEM_CONVERT[item["type"]][0])
             item["timer"] -= dt
-            if item["timer"] <= 0:
+            if item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is not None:
                 item["type"] = ITEM_CONVERT[item["type"]][1]
                 if item["type"] in MAX_ITEM_DUR:
                     item["dur"] = MAX_ITEM_DUR[item["type"]]
                 del item["timer"]
+            elif item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is None:
+                items.remove(item)
+                break
 
     # === DRAW EVERYTHING ===
     WIN.fill(WHITE)
@@ -516,15 +585,21 @@ while running:
     draw_world(camera_x, camera_y)
 
     # === ITEMS ===
+    chunk_range = 3 * CHUNK_SIZE * TILE_SIZE
     for item in items:
-        screen_x = item["x"] - camera_x
-        screen_y = item["y"] - camera_y
-        WIN.blit(ITEM_IMAGES[item["type"]], (screen_x, screen_y))
+        if abs(item["x"] - player_x) <= chunk_range and abs(item["y"] - player_y) <= chunk_range:
+            screen_x = item["x"] - camera_x
+            screen_y = item["y"] - camera_y
+            WIN.blit(ITEM_IMAGES[item["type"]], (screen_x, screen_y))
 
     # === PLAYER ===
     player_screen_x = WIDTH // 2 - player_size // 2
     player_screen_y = HEIGHT // 2 - player_size // 2
-    pygame.draw.rect(WIN, BLUE, (player_screen_x, player_screen_y, player_size, player_size))
+    mouse_player_atan2 = math.atan2((mouse_pos[1] - player_screen_y) - player_size//2, (mouse_pos[0] - player_screen_x) - player_size//2)
+    player_texture_rotated = pygame.transform.rotate(player_texture, -math.degrees(mouse_player_atan2) - 90)
+    player_rect = player_texture_rotated.get_rect(center=(WIDTH//2, HEIGHT//2))
+    WIN.blit(player_texture_rotated, player_rect.topleft)
+    pygame.draw.circle(WIN, (100, 100, 255), (WIDTH//2,HEIGHT//2), 10)
 
     # === GUI (no camera offset) ===
     draw_inventory()
@@ -540,7 +615,7 @@ while running:
                 dur_text = font.render(f"Durability: {(item['dur'] / MAX_ITEM_DUR[item['type']])*100:.2f}%", True, BLACK)
                 WIN.blit(dur_text, (mouse_pos[0] + 15, mouse_pos[1] + 35))
             if "timer" in item:
-                timer_text = font.render(f"Burning in: {item['timer']:.1f}s", True, BLACK)
+                timer_text = font.render(f"{ITEM_CONVERT_LABELS[item[type]]}{item['timer']:.1f}s", True, BLACK)
                 WIN.blit(timer_text, (mouse_pos[0] + 15, mouse_pos[1] + 55))
             break
 
