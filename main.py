@@ -1,7 +1,7 @@
 import pygame
 import math
 import random
-import opensimplex
+import noise
 import hashlib
 import sys
 import os
@@ -45,14 +45,22 @@ TILE_IMAGES = {
     "stone": pygame.image.load(os.path.join(TILE_PATH, "stone.png")),
     "sedimentary_stone": pygame.image.load(os.path.join(TILE_PATH, "sedimentary_stone.png")),
     "water": pygame.image.load(os.path.join(TILE_PATH, "water.png")),
+    "sedimentary_iron": pygame.image.load(os.path.join(TILE_PATH, "sedimentary_iron.png")),
+    "laterite_soil": pygame.image.load(os.path.join(TILE_PATH, "laterite_soil.png")),
 }
+ORE_TYPES = [
+    {"name": "sedimentary_iron", "rarity": 0.4},
+    {"name": "laterite_soil", "rarity": 0.5}
+]
 
 # Scale tiles to match TILE_SIZE
 for key in TILE_IMAGES:
     TILE_IMAGES[key] = pygame.transform.scale(TILE_IMAGES[key], (TILE_SIZE, TILE_SIZE))
 
 CHUNK_SIZE = 16
-WORLD_SEED = 9999
+WORLD_SEED = 9
+NOISE = noise.combine_noise_smooth(noise.make_fractal_mask(WORLD_SEED, ),noise.make_perlin(WORLD_SEED))
+ORE_NOISE = noise.make_ore_patches(WORLD_SEED+1, [0.05, 0.1], [0.4, 0.5])
 world_chunks = {}
 items = []
 
@@ -84,7 +92,6 @@ def generate_item(tile_type, x, y):
 
 def generate_chunk(cx, cy):
     """Generate a single chunk of terrain and spawn items into global items list."""
-    opns = opensimplex.OpenSimplex(WORLD_SEED)
     chunk_tiles = []
 
     for ty in range(CHUNK_SIZE):
@@ -92,18 +99,28 @@ def generate_chunk(cx, cy):
         for tx in range(CHUNK_SIZE):
             world_x = cx * CHUNK_SIZE + tx
             world_y = cy * CHUNK_SIZE + ty
-            r = opns.noise2(world_x / 20, world_y / 20) / 2 + 1
+            r = NOISE(world_x / 100, world_y / 100)
 
-            if r < 0.735:
-                tile = "grass"
-            elif r < 0.75:
-                tile = "dirt"
-            elif r < 0.9:
+            print(f"Chunk ({cx},{cy}) Tile ({tx},{ty}) World ({world_x},{world_y}) Noise: {r}")
+
+            if r < 0.3:
+                tile = "water"
+            elif r < 0.4:
                 tile = "sand"
-            elif r < 0.97:
-                tile = "water"
+            elif r < 0.41:
+                tile = "dirt"
+            elif r < 0.6:
+                tile = "grass"
+            elif r < 0.62:
+                tile = "dirt"
+            elif r < 0.8:
+                tile = "stone"
+                ore = ORE_NOISE(world_x, world_y)
+                if ore != 0:
+                    ore_name = ORE_TYPES[ore - 1]["name"]
+                    tile = ore_name
             else:
-                tile = "water"
+                tile = "sedimentary_stone"
 
             row.append(tile)
 
@@ -189,11 +206,13 @@ MAX_ITEM_DUR = {
 ITEM_CONVERT = {
     "burning_cotton_boll": [5, None],
     "burning_wood_dust": [10, "ashes"],
+    "cocoa_beans_bamboo_bottle": [300, "fermented_cocoa_beans_bamboo_bottle"],
 }
 
 ITEM_CONVERT_LABELS = {
     "burning_cotton_boll": "Burns in: ",
-    "wood_dust": "Burns in: ",
+    "burning_wood_dust": "Burns in: ",
+    "cocoa_beans_bamboo_bottle": "Ferments in: ",
 }
 
 ITEM_SIZE = 40
@@ -203,7 +222,6 @@ for key in ITEM_IMAGES:
 # === ITEM SPAWNING ===
 def spawn_items(num=30):
     items = []
-    items.append({"type": "fire_plough", "x": 400, "y": 300, "dur": 20})
     for _ in range(num):
         item_type = random.choice(["rock", "rattan", "stick", "cotton_plant"])
         x = random.randint(0, WIDTH - ITEM_SIZE)
@@ -270,9 +288,9 @@ def get_craft_result(inputs):
     elif sorted(input_types) == sorted(["cracked_rock", "cracked_rock"]):
         return ["cracked_rock", "stone_chisel"]
     elif sorted(input_types) == sorted(["stone_chisel", "stick"]):
-        return ["carved_stick"]
+        return ["carved_stick", "wood_dust"]
     elif sorted(input_types) == sorted(["carved_stick", "stone_chisel"]):
-        return ["holed_stick"]
+        return ["holed_stick", "wood_dust"]
     elif sorted(input_types) == sorted(["pointy_stick", "carved_stick"]):
         return ["fire_plough"]
     elif sorted(input_types) == sorted(["holed_stick", "ashes"]):
@@ -283,6 +301,10 @@ def get_craft_result(inputs):
         return ["stone_axe"]
     elif sorted(input_types) == sorted(["cotton_boll", "fire_plough"]):
         return ["burning_cotton_boll"]
+    elif sorted(input_types) == sorted(["wood_dust", "fire_plough"]):
+        return ["burning_wood_dust"]
+    elif sorted(input_types) == sorted(["wood_dust", "burning_cotton"]):
+        return ["burning_wood_dust"]
     else:
         return []
 
@@ -304,6 +326,8 @@ def get_craft_result_durs(inputs):
         return [["sharp_rock", "gone"]]
     elif sorted(input_types) == sorted(["cotton_boll", "fire_plough"]):
         return [["fire_plough", -1]]
+    elif sorted(input_types) == sorted(["wood_dust", "fire_plough"]):
+        return [["fire_plough", -3]]
     else:
         return []
 
@@ -369,6 +393,24 @@ def perform_craft():
 
     update_craft_output()
 
+# === HELPER FUNCTIONS ===
+def find_spawn_location(search_radius=10):
+    """Finds the nearest non-water tile near (0,0) and returns its world position."""
+    for radius in range(search_radius):
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                world_x = dx
+                world_y = dy
+                r = NOISE(world_x / 100, world_y / 100)
+                
+                # Match your tile thresholds from generate_chunk()
+                if r >= 0.3:  # 0.3+ means not water
+                    # Found land!
+                    return (world_x * TILE_SIZE + TILE_SIZE // 2,
+                            world_y * TILE_SIZE + TILE_SIZE // 2)
+    # fallback if somehow all water
+    return (0, 0)
+
 # === DRAW FUNCTIONS ===
 def draw_inventory():
     slot_rects = get_inventory_slot_rects()
@@ -380,7 +422,7 @@ def draw_inventory():
             img_rect = img.get_rect(center=rect.center)
             WIN.blit(img, img_rect)
             
-            # Draw durability bar
+            # Draw durability bars
             if "dur" in inventory[i]:
                 max_dur = MAX_ITEM_DUR[inventory[i]["type"]]
                 dur_ratio = inventory[i]["dur"] / max_dur
@@ -437,6 +479,8 @@ def draw_crafting_gui():
             pygame.draw.rect(WIN, BLACK, (rect.x, rect.bottom - 6, rect.width, 5), 1)
 
 # === MAIN LOOP ===
+player_x, player_y = find_spawn_location()
+
 running = True
 while running:
     dt = clock.tick(60) / 1000
@@ -464,9 +508,9 @@ while running:
                                 break
 
         # === Mouse down ===
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        if event.type == pygame.MOUSEBUTTONDOWN:
             # GUI closed → pick/drop
-            if not crafting_visible:
+            if event.button == 1 and not crafting_visible:
                 player_rect = pygame.Rect(player_x, player_y, player_size, player_size)
                 # Drop item
                 for i, rect in enumerate(get_inventory_slot_rects()):
@@ -494,28 +538,51 @@ while running:
 
             # GUI open → drag or craft
             else:
-                # Click arrow to craft
-                if arrow_rect.collidepoint(mouse_pos):
-                    perform_craft()
-                    break
+                if event.button == 1:
+                    # Click arrow to craft
+                    if arrow_rect.collidepoint(mouse_pos):
+                        perform_craft()
+                        break
 
                 # Check crafting slots for drag
                 for i, rect in enumerate(craft_slot_rects):
                     if rect.collidepoint(mouse_pos) and craft_slots[i]:
-                        drag_item = craft_slots[i]
-                        craft_slots[i] = None
-                        drag_origin = ("craft", i)
-                        drag_offset = (mouse_pos[0] - rect.x, mouse_pos[1] - rect.y)
-                        break
+                        if event.button == 1:
+                            drag_item = craft_slots[i]
+                            craft_slots[i] = None
+                            drag_origin = ("craft", i)
+                            drag_offset = (mouse_pos[0] - rect.x, mouse_pos[1] - rect.y)
+                            break
+                        elif event.button == 3:
+                            # Right-click to remove item back to inventory
+                            if craft_slots[i]:
+                                for j in range(2):
+                                    if inventory[j] is None:
+                                        inventory[j] = craft_slots[i]
+                                        craft_slots[i] = None
+                                        update_craft_output()
+                                        break
+                            break
 
                 # Check inventory slots for drag
                 for i, rect in enumerate(get_inventory_slot_rects()):
                     if rect.collidepoint(mouse_pos) and inventory[i]:
-                        drag_item = inventory[i]
-                        inventory[i] = None
-                        drag_origin = ("inventory", i)
-                        drag_offset = (mouse_pos[0] - rect.x, mouse_pos[1] - rect.y)
-                        break
+                        if event.button == 1:
+                            drag_item = inventory[i]
+                            inventory[i] = None
+                            drag_origin = ("inventory", i)
+                            drag_offset = (mouse_pos[0] - rect.x, mouse_pos[1] - rect.y)
+                            break
+                        elif event.button == 3:
+                            # Right-click to move item to crafting slot
+                            if inventory[i]:
+                                for j, craft_rect in enumerate(craft_slot_rects):
+                                    if not craft_slots[j]:
+                                        craft_slots[j] = inventory[i]
+                                        inventory[i] = None
+                                        update_craft_output()
+                                        break
+                            break
 
         # === Mouse up ===
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and drag_item:
@@ -615,7 +682,7 @@ while running:
                 dur_text = font.render(f"Durability: {(item['dur'] / MAX_ITEM_DUR[item['type']])*100:.2f}%", True, BLACK)
                 WIN.blit(dur_text, (mouse_pos[0] + 15, mouse_pos[1] + 35))
             if "timer" in item:
-                timer_text = font.render(f"{ITEM_CONVERT_LABELS[item[type]]}{item['timer']:.1f}s", True, BLACK)
+                timer_text = font.render(f"{ITEM_CONVERT_LABELS[item['type']]}{item['timer']:.1f}s", True, BLACK)
                 WIN.blit(timer_text, (mouse_pos[0] + 15, mouse_pos[1] + 55))
             break
 
