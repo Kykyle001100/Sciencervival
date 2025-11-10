@@ -9,6 +9,7 @@ import time
 import pygame
 import ctypes
 from ctypes import wintypes
+from pygame import mask
 
 pygame.init()
 
@@ -42,7 +43,7 @@ font = pygame.font.Font("font.ttf", 20)
 WHITE = (255, 255, 255)
 BLUE = (50, 100, 255)
 BLACK = (0, 0, 0)
-LIGHT_GRAY = (220, 220, 220)
+LIGHT_GRAY = (200, 200, 200)
 DARK_GRAY = (150, 150, 150)
 
 # === CLOCK ===
@@ -138,6 +139,12 @@ player_size = 80
 player_x = WIDTH // 2
 player_y = HEIGHT // 2
 player_speed = 5
+# Add these new variables
+player_vel_x = 0
+player_vel_y = 0
+player_acceleration = player_speed  # Acceleration rate
+player_friction = 0.5  # Friction coefficient
+
 player_texture = pygame.transform.scale(pygame.image.load(os.path.join("other", "character.png")), (player_size, player_size))
 
 # === PLAYER STATS ===
@@ -155,7 +162,10 @@ stamina = MAX_STAMINA
 HUNGER_DECAY = 1      # per 10 seconds
 THIRST_DECAY = 2      # per 10 seconds
 STAMINA_RECOVER = 1   # per second (when not moving)
-STAMINA_DRAIN = 1    # per second (when moving)
+STAMINA_DRAIN = 0.1     # per second (when moving)
+
+MAX_DELTA_TIME = 0.2  # Maximum allowed delta time (seconds)
+MAX_VELOCITY = 5000    # Maximum velocity for player movement
 
 # === TILE SETTINGS ===
 TILE_SIZE = 100
@@ -170,9 +180,12 @@ TILE_IMAGES = {
     "dirt": pygame.image.load(os.path.join(TILE_PATH, "dirt.png")),
     "stone": pygame.image.load(os.path.join(TILE_PATH, "stone.png")),
     "sedimentary_stone": pygame.image.load(os.path.join(TILE_PATH, "sedimentary_stone.png")),
-    "water": pygame.image.load(os.path.join(TILE_PATH, "water.png")),
+    "water": pygame.image.load(os.path.join(TILE_PATH, "saltwater.png")),
     "sedimentary_iron": pygame.image.load(os.path.join(TILE_PATH, "sedimentary_iron.png")),
     "laterite_soil": pygame.image.load(os.path.join(TILE_PATH, "laterite_soil.png")),
+    "freshwater": pygame.image.load(os.path.join(TILE_PATH, "freshwater.png")),
+    "iob": pygame.image.load(os.path.join(TILE_PATH, "iob.png")),
+    "earthworm_dirt": pygame.image.load(os.path.join(TILE_PATH, "earthworm_dirt.png")),
 }
 ORE_TYPES = [
     {"name": "sedimentary_iron", "rarity": 0.4},
@@ -186,15 +199,50 @@ PLANT_STATS = {
         "last_drop": None,
         "prelast_drop": ["mung_beans"],
         "stages": [
-            {"name": "ve", "timer_mins": 1},
-            {"name": "v1", "timer_mins": 1},
-            {"name": "v2", "timer_mins": 1},
-            {"name": "v3", "timer_mins": 3},
-            {"name": "v6", "timer_mins": 3},
+            {"name": "ve", "timer_mins": 1, "max_health": 1},
+            {"name": "v1", "timer_mins": 1, "max_health": 1},
+            {"name": "v2", "timer_mins": 1, "max_health": 1},
+            {"name": "v3", "timer_mins": 3, "max_health": 1},
+            {"name": "v6", "timer_mins": 3, "max_health": 1},
         ],
-        "last_stage": "flowering",
-        "last_stage_last": "fruited",
-        "only_tiles": ["grass", "dirt"]
+        "last_stage": "flowering", # max_health = prelast_max_health averaged
+        "last_stage_last": "fruited", # max_health = prelast_max_health averaged
+        "only_tiles": ["grass", "dirt"],
+        "can_collide": False,
+        "harvest": {
+            "ve": "harvest",
+            "v1": "harvest",
+            "v2": "harvest",
+            "v3": "harvest",
+            "v6": "harvest",
+            "flowering": "harvest",
+            "fruited": "harvest",
+        }
+    },
+    "bamboo": {
+        "pollination": None,
+        "fruit_time": None,
+        "lastlast_drop": [],
+        "last_drop": [],
+        "prelast_drop": ["bamboo_shoot"],
+        "stages": [
+            {"name": "shoot", "timer_mins": 4, "max_health": 5},
+            {"name": "grown_shoot", "timer_mins": 4, "max_health": 10},
+            {"name": "v1", "timer_mins": 10, "max_health": 20},
+            {"name": "v2", "timer_mins": 10, "max_health": 40},
+            {"name": "v3", "timer_mins": 10, "max_health": 60},
+        ],
+        "last_stage": None,
+        "last_stage_last": None,
+        "only_tiles": ["grass", "dirt"],
+        "can_collide": True,
+        "harvest": {
+            "shoot": "harvest",
+            "grown_shoot": "harvest",
+            "v1": "chop",
+            "v2": "chop",
+            "v3": "chop",
+        }
     }
 }
 
@@ -206,18 +254,27 @@ CHUNK_SIZE = 16
 WORLD_SEED = 9
 NOISE = noise.combine_noise_smooth(noise.make_fractal_mask(WORLD_SEED, ),noise.make_perlin(WORLD_SEED))
 ORE_NOISE = noise.make_ore_patches(WORLD_SEED+1, [0.05, 0.1], [0.4, 0.5])
+LAKE_NOISE = noise.make_ore_patches(WORLD_SEED+2, [0.05], [0.52])
 world_chunks = {}
 items = []
 plants = []
+animals = []
 WORLD_TILE_ITEMS = {}  # {(tile_x, tile_y): item_dict} — deferred/generated items not yet in `items`
 
 def spawn_plant(plant_type, x, y, growth_stage="ve", growth_timer=0):
+    stages = PLANT_STATS[plant_type]["stages"]
+    stage = None
+    for s in stages:
+        if s["name"] == growth_stage:
+            stage = s
+
     plant = {
         "type": plant_type,
         "x": x,
         "y": y,
         "growth_stage": growth_stage,
-        "growth_timer": growth_timer
+        "growth_timer": growth_timer,
+        "health": 1 if stage is None else stage["max_health"]
     }
     return plant
 
@@ -265,39 +322,72 @@ def generate_plant(tile, world_x, world_y):
             stages = PLANT_STATS["mung_bean"]["stages"]
             stage = stages[int(sh*(len(stages)-1))]
             return spawn_plant("mung_bean", px, py, stage["name"], stage["timer_mins"]*th)
+        elif h < 0.08:
+            stages = PLANT_STATS["bamboo"]["stages"]
+            stage = stages[int(sh*(len(stages)-1))]
+            return spawn_plant("bamboo", px, py, stage["name"], stage["timer_mins"]*th)
+        
+def get_tile(world_x, world_y):
+    r = NOISE(world_x / 100, world_y / 100)
+
+    if r < 0.3:
+        tile = "water"
+    elif r < 0.4:
+        tile = "sand"
+    elif r < 0.41:
+        tile = "dirt"
+    elif r < 0.6:
+        tile = "grass"
+        lake = LAKE_NOISE(world_x, world_y)
+        if lake != 0:
+            tile = "freshwater"
+            ore = ORE_NOISE(world_x, world_y)
+            if ore != 0:
+                ore_name = ORE_TYPES[ore - 1]["name"]
+                if ore_name == "sedimentary_iron":
+                    tile = "iob"
+        else:
+            h = float(int(hashlib.md5(f"{world_x}___{world_y}___{WORLD_SEED}".encode()).hexdigest(), 16) % 100) / 100.0
+            if h < 0.01:
+                tile = "earthworm_dirt"
+    elif r < 0.62:
+        tile = "dirt"
+    elif r < 0.8:
+        tile = "stone"
+        ore = ORE_NOISE(world_x, world_y)
+        if ore != 0:
+            ore_name = ORE_TYPES[ore - 1]["name"]
+            tile = ore_name
+    else:
+        tile = "sedimentary_stone"
+
+    return tile
 
 def generate_chunk(cx, cy):
     """Generate a single chunk of terrain and spawn items into global items list."""
     chunk_tiles = []
-
+    
     for ty in range(CHUNK_SIZE):
         row = []
         for tx in range(CHUNK_SIZE):
             world_x = cx * CHUNK_SIZE + tx
             world_y = cy * CHUNK_SIZE + ty
-            r = NOISE(world_x / 100, world_y / 100)
-
-            if r < 0.3:
-                tile = "water"
-            elif r < 0.4:
-                tile = "sand"
-            elif r < 0.41:
-                tile = "dirt"
-            elif r < 0.6:
-                tile = "grass"
-            elif r < 0.62:
-                tile = "dirt"
-            elif r < 0.8:
-                tile = "stone"
-                ore = ORE_NOISE(world_x, world_y)
-                if ore != 0:
-                    ore_name = ORE_TYPES[ore - 1]["name"]
-                    tile = ore_name
-            else:
-                tile = "sedimentary_stone"
-
+            tile = get_tile(world_x, world_y)
+            
             row.append(tile)
-
+            
+            # Spawn animals (with very low probability)
+            if random.random() < 0.1:  # Adjust probability as needed
+                if tile == "grass":
+                    if random.random() < 0.8:
+                        animals.append(spawn_animal("earthworm", 
+                            world_x * TILE_SIZE + TILE_SIZE//2,
+                            world_y * TILE_SIZE + TILE_SIZE//2))
+                    else:
+                        animals.append(spawn_animal("pigeon",
+                            world_x * TILE_SIZE + TILE_SIZE//2,
+                            world_y * TILE_SIZE + TILE_SIZE//2))
+                        
             # === Generate item directly into global items list ===
             item = generate_item(tile, world_x, world_y)
             if item and (world_x, world_y) not in ITEMED_TILE:
@@ -324,8 +414,8 @@ def draw_world(camera_x, camera_y):
     end_tile_x = (camera_x + WIDTH) // TILE_SIZE + 1
     end_tile_y = (camera_y + HEIGHT) // TILE_SIZE + 1
 
-    for tile_y in range(start_tile_y, end_tile_y):
-        for tile_x in range(start_tile_x, end_tile_x):
+    for tile_y in range(int(start_tile_y), int(end_tile_y)):
+        for tile_x in range(int(start_tile_x), int(end_tile_x)):
             chunk_x = tile_x // CHUNK_SIZE
             chunk_y = tile_y // CHUNK_SIZE
             local_x = tile_x % CHUNK_SIZE
@@ -356,11 +446,37 @@ PLANT_IMAGES = {
         "v6": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("mung_bean", "v6.png"))),
         "flowering": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("mung_bean", "flowering.png"))),
         "fruited": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("mung_bean", "fruited.png"))),
+    },
+    "bamboo": {
+        "shoot": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("bamboo", "shoot.png"))),
+        "grown_shoot": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("bamboo", "grown_shoot.png"))),
+        "v1": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("bamboo", "v1.png"))),
+        "v2": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("bamboo", "v2.png"))),
+        "v3": pygame.image.load(os.path.join(PLANT_PATH, os.path.join("bamboo", "v3.png"))),
     }
 }
 for plant_type in PLANT_IMAGES:
     for stage in PLANT_IMAGES[plant_type]:
         PLANT_IMAGES[plant_type][stage] = pygame.transform.scale(PLANT_IMAGES[plant_type][stage], (PLANT_SIZE, PLANT_SIZE))
+
+# Create masks for player and plant textures
+player_mask = pygame.mask.from_surface(player_texture)
+player_mask_radius = max(player_mask.get_size()) // 2
+
+def get_tighter_radius(mask):
+    """Get radius excluding empty edges."""
+    bbox = mask.get_bounding_rects()[0]
+    return max(bbox.width, bbox.height) // 2
+
+PLANT_MASKS = {}
+for plant_type in PLANT_IMAGES:
+    PLANT_MASKS[plant_type] = {}
+    for stage in PLANT_IMAGES[plant_type]:
+        texture = PLANT_IMAGES[plant_type][stage]
+        plant_mask = pygame.mask.from_surface(texture)
+        # Get the actual radius from non-transparent pixels
+        w, h = plant_mask.get_size()
+        PLANT_MASKS[plant_type][stage] = get_tighter_radius(plant_mask)
 
 # === LOAD ITEM TEXTURES ===
 RESOURCE_PATH = "resources"
@@ -385,8 +501,8 @@ ITEM_IMAGES = {
     "mung_beans": pygame.image.load(os.path.join(RESOURCE_PATH, "mung_beans.png")),
     "fire_plough": pygame.image.load(os.path.join(RESOURCE_PATH, "fire_plough.png")),
     "ashed_holed_stick": pygame.image.load(os.path.join(RESOURCE_PATH, "ashed_holed_stick.png")),
-    "nonfunctional_stone_axe": pygame.image.load(os.path.join(RESOURCE_PATH, "nonfunctional_stone_axe.png")),
-    "stone_axe": pygame.image.load(os.path.join(RESOURCE_PATH, "stone_axe.png")),
+    "nonfunctional_stone_hatchet": pygame.image.load(os.path.join(RESOURCE_PATH, "nonfunctional_stone_hatchet.png")),
+    "stone_hatchet": pygame.image.load(os.path.join(RESOURCE_PATH, "stone_hatchet.png")),
     "burning_cotton_boll": pygame.image.load(os.path.join(RESOURCE_PATH, "burning_cotton_boll.png")),
     "ashes": pygame.image.load(os.path.join(RESOURCE_PATH, "ashes.png")),
     "wood_dust": pygame.image.load(os.path.join(RESOURCE_PATH, "wood_dust.png")),
@@ -406,7 +522,24 @@ ITEM_IMAGES = {
     "freshwater_ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "freshwater_ceramic_cup.png")),
     "drinkable_water_ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "drinkable_water_ceramic_cup.png")),
     "iob_ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "iob_ceramic_cup.png")),
-    "anoxic_iob_ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "iob_ceramic_cup.png")),
+    "anoxic_iob_ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "anoxic_iob_ceramic_cup.png")),
+    "bamboo_bottle": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo_bottle.png")),
+    "green_basket": pygame.image.load(os.path.join(RESOURCE_PATH, "green_basket.png")),
+    "green_weaved_cone": pygame.image.load(os.path.join(RESOURCE_PATH, "green_weaved_cone.png")),
+    "weaved_fiber": pygame.image.load(os.path.join(RESOURCE_PATH, "weaved_fiber.png")),
+    "iron_rock": pygame.image.load(os.path.join(RESOURCE_PATH, "iron_rock.png")),
+    "bamboo": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo.png")),
+    "hollow_bamboo": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo_pipe.png")),
+    "bamboo_bottle": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo_bottle.png")),
+    "saltwater_bamboo_bottle": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo_bottle.png")),
+    "freshwater_bamboo_bottle": pygame.image.load(os.path.join(RESOURCE_PATH, "bamboo_bottle.png")),
+    "earthworm": pygame.image.load(os.path.join(RESOURCE_PATH, "earthworm.png")),
+    "earthworm_waste": pygame.image.load(os.path.join(RESOURCE_PATH, "earthworm_waste.png")),
+    "fertilizer": pygame.image.load(os.path.join(RESOURCE_PATH, "fertilizer.png")),
+    "charcoal": pygame.image.load(os.path.join(RESOURCE_PATH, "charcoal.png")),
+    "coal": pygame.image.load(os.path.join(RESOURCE_PATH, "coal.png")),
+    "quicklime": pygame.image.load(os.path.join(RESOURCE_PATH, "quicklime.png")),
+    "slaked_lime_Ceramic_cup": pygame.image.load(os.path.join(RESOURCE_PATH, "drinkable_water_ceramic_cup.png")),
 }
 
 MAX_ITEM_DUR = {
@@ -414,64 +547,177 @@ MAX_ITEM_DUR = {
     "stone_chisel": 5,
     "pointy_stick": 10,
     "fire_plough": 20,
-    "stone_axe": 50,
+    "stone_hatchet": 50,
 }
 
 ITEM_CONVERT = {
     "burning_cotton_boll": [5, None],
     "burning_wood_dust": [10, "ashes"],
     "clay_cup": [60, "dried_clay_cup"],
+    "iob_ceramic_cup": [70, "anoxic_iob_ceramic_cup"]
+}
+
+MINING_TOOLS = {
+    "stone_hatchet": {
+        "ores": {
+            "sedimentary_iron": {"tool_dur": -20, "ore_converts": "stone", "item_drop": ["iron_rock"]},
+        },
+        "plants": {
+            "bamboo": {"tool_dur": -2, "plant_damage": 7, "plant_converts": None, "item_drop": {"v1": ["bamboo", "bamboo"], "v2": ["bamboo", "bamboo", "bamboo"], "v3": ["bamboo", "bamboo", "bamboo", "bamboo"]}}
+        }
+    }
 }
 
 ITEM_CONVERT_LABELS = {
     "burning_cotton_boll": "Burns in: ",
     "burning_wood_dust": "Burns in: ",
     "cocoa_beans_bamboo_bottle": "Ferments in: ",
-    "clay_cup": "Dries in: "
+    "clay_cup": "Dries in: ",
+    "iob_ceramic_cup": "Anoxicates in: "
 }
 
 FOOD_STATS = {
     "carrot": {"hunger": 10, "thirst": -10, "stamina": 0},
     "drinkable_water_ceramic_cup": {"hunger": 0, "thirst": 35, "stamina": 10},
-    "saltwater_ceramic_cup": {"hunger": 1, "thirst": -15, "stamina": -5}
+    "saltwater_ceramic_cup": {"hunger": 1, "thirst": -15, "stamina": -5},
+    "freshwater_ceramic_cup": {"hunger": 1, "thirst": 10, "stamina": 2}
 }
 
 FOOD_CONVERTS = {
     "carrot": None,
     "drinkable_water_ceramic_cup": "ceramic_cup",
-    "saltwater_ceramic_cup": "ceramic_cup"
+    "saltwater_ceramic_cup": "ceramic_cup",
+    "freshwater_ceramic_cup": "ceramic_cup"
 }
 
 CONSUME_TYPES = {
     "carrot": "Eat",
     "drinkable_water_ceramic_cup": "Drink",
-    "saltwater_ceramic_cup": "Drink"
+    "saltwater_ceramic_cup": "Drink",
+    "freshwater_ceramic_cup": "Drink"
 }
 
 ITEM_TILE_INTERACTION = {
     "ceramic_cup": {
-        "water": { "item_converts": "saltwater_ceramic_cup"}
+        "water": {"item_converts": "saltwater_ceramic_cup", "tile_converts": "water"},
+        "iob": {"item_converts": "iob_ceramic_cup", "tile_converts": "freshwater"},
+        "freshwater": {"item_converts": "freshwater_ceramic_cup", "tile_converts": "dirt"}
+    },
+    "bamboo_bottle": {
+        "water": {"item_converts": "saltwater_bamboo_bottle", "tile_converts": "water"},
+        "freshwater": {"item_converts": "freshwater_bamboo_bottle", "tile_converts": "dirt"}
     }
 }
+
+STORAGE_ITEMS = {
+    "green_basket": {
+        "slots": 3,
+        "slot_rects": [
+            pygame.Rect(0, HEIGHT//2-70, 60, 60),
+            pygame.Rect(0, HEIGHT//2, 60, 60),
+            pygame.Rect(0, HEIGHT//2+70, 60, 60)
+        ],
+        "gui_frame_rect": pygame.Rect(WIDTH-90, HEIGHT//2-80, 80, 230),
+        "slot_rects_custom": [
+            {"centerx": "gui_frame_rect_centerx"},
+            {"centerx": "gui_frame_rect_centerx"},
+            {"centerx": "gui_frame_rect_centerx"}
+        ],
+        "not_allowed_items": ["green_basket"]
+    }
+}
+
+def handle_tool_action(tool_item, target_type, target_data, world_x, world_y):
+    """Handle mining ores or chopping plants with tools.
+    Returns: (keep_target, keep_tool)"""
+    
+    if tool_item["type"] not in MINING_TOOLS:
+        return True, True  # No effect
+        
+    tool_data = MINING_TOOLS[tool_item["type"]]
+    
+    # Check if target is an ore
+    if "ores" in tool_data and target_type in tool_data["ores"]:
+        ore_data = tool_data["ores"][target_type]
+        
+        # Update tool durability
+        tool_item["dur"] += ore_data["tool_dur"]
+        
+        # Convert tile
+        if ore_data["ore_converts"]:
+            chunk_x = world_x // CHUNK_SIZE
+            chunk_y = world_y // CHUNK_SIZE
+            local_x = world_x % CHUNK_SIZE 
+            local_y = world_y % CHUNK_SIZE
+            chunk = get_chunk(chunk_x, chunk_y)
+            chunk[local_y][local_x] = ore_data["ore_converts"]
+            
+        # Spawn drops
+        for drop in ore_data["item_drop"]:
+            items.append({
+                "type": drop,
+                "x": world_x * TILE_SIZE + random.randint(-20, 20),
+                "y": world_y * TILE_SIZE + random.randint(-20, 20)
+            })
+            
+        return False, tool_item["dur"] > 0
+        
+    # Check if target is a plant
+    elif "plants" in tool_data and target_data and target_data["type"] in tool_data["plants"]:
+        plant_data = tool_data["plants"][target_data["type"]]
+        
+        # Update tool durability
+        tool_item["dur"] += plant_data.get("tool_dur", 0)
+        
+        # Damage the plant using configured damage value
+        damage = plant_data.get("plant_damage", 0)
+        # First, check if this tool can perform the required action on this growth stage
+        stage = target_data["growth_stage"]
+        plant_stats = PLANT_STATS.get(target_data["type"], {})
+        harvest_map = plant_stats.get("harvest", {})
+        required_action = harvest_map.get(stage)  # e.g. "harvest" or "chop"
+        # If there's a required action and it's not appropriate for this tool, do nothing
+        # (Assume tools configured in MINING_TOOLS are intended to perform 'chop' actions)
+        if required_action and required_action not in ("chop", "harvest"):
+            return True, tool_item["dur"] > 0
+        
+        # Apply damage and check if plant survives
+        target_data["health"] = target_data.get("health", 1) - damage
+        if target_data["health"] > 0:
+            # still standing (hit effect could be added here)
+            return True, tool_item["dur"] > 0
+        
+        # Plant destroyed: determine drops
+        if isinstance(plant_data.get("item_drop"), dict):
+            drops = plant_data["item_drop"].get(stage, [])
+        else:
+            drops = plant_data.get("item_drop", []) or []
+        
+        # Fallback to plant definition drops if tool config provides none
+        if not drops:
+            if stage == plant_stats.get("last_stage_last"):
+                drops = plant_stats.get("lastlast_drop", []) or []
+            elif stage == plant_stats.get("last_stage"):
+                drops = plant_stats.get("last_drop", []) or []
+            else:
+                drops = plant_stats.get("prelast_drop", []) or []
+        
+        # Spawn drops at plant position
+        for drop in drops:
+            items.append({
+                "type": drop,
+                "x": int(target_data.get("x", 0)) + random.randint(-20, 20),
+                "y": int(target_data.get("y", 0)) + random.randint(-20, 20)
+            })
+            
+        # Caller should remove the plant if keep_target is False
+        return False, tool_item["dur"] > 0
+        
+    return True, True
 
 ITEM_SIZE = 40
 for key in ITEM_IMAGES:
     ITEM_IMAGES[key] = pygame.transform.scale(ITEM_IMAGES[key], (ITEM_SIZE, ITEM_SIZE))
-
-# === ITEM SPAWNING ===
-def spawn_items(num=30):
-    items = []
-    for _ in range(num):
-        item_type = random.choice(["rock", "rattan", "stick", "cotton_plant"])
-        x = random.randint(0, WIDTH - ITEM_SIZE)
-        y = random.randint(0, HEIGHT - ITEM_SIZE)
-        item = {"type": item_type, "x": x, "y": y}
-        if item_type in MAX_ITEM_DUR:
-            item["dur"] = MAX_ITEM_DUR[item_type]
-        items.append(item)
-    return items
-
-#items.extend(spawn_items())
 
 # === INVENTORY ===
 inventory = [None, None]
@@ -486,6 +732,69 @@ def get_inventory_slot_rects():
         pygame.Rect(start_x + i * (slot_size + slot_margin), y, slot_size, slot_size)
         for i in range(2)
     ]
+
+# === STORAGE GUI STATE ===
+storage_open = None  # when not None contains inventory index of the storage item being opened
+
+def open_storage(inv_index):
+    """Open storage held in inventory slot inv_index. Ensure it has a 'contents' list."""
+    global storage_open
+    if inv_index < 0 or inv_index >= len(inventory):
+        return
+    item = inventory[inv_index]
+    if not item:
+        return
+    st_def = STORAGE_ITEMS.get(item["type"])
+    if not st_def:
+        return
+    if "contents" not in item:
+        item["contents"] = [None] * st_def["slots"]
+    storage_open = inv_index
+
+def close_storage():
+    global storage_open
+    storage_open = None
+
+def get_storage_slot_rects(storage_def):
+    """Generate slot rects inside storage_def['gui_frame_rect'] (runtime-calculated)."""
+    frame = storage_def.get("gui_frame_rect", pygame.Rect(0,0,200,200))
+    slots = storage_def["slots"]
+    rects = []
+    padding_top = 20
+    spacing = slot_size + 10
+    for i in range(slots):
+        cx = frame.centerx
+        rx = cx - slot_size // 2
+        ry = frame.y + padding_top + i * spacing
+        rects.append(pygame.Rect(rx, ry, slot_size, slot_size))
+    return rects
+
+def draw_storage_gui():
+    """Draw currently-open storage GUI and its contents."""
+    if storage_open is None:
+        return
+    st_item = inventory[storage_open]
+    if not st_item:
+        close_storage()
+        return
+    st_def = STORAGE_ITEMS.get(st_item["type"])
+    if not st_def:
+        close_storage()
+        return
+    frame = st_def["gui_frame_rect"]
+    pygame.draw.rect(WIN, DARK_GRAY, frame)
+    pygame.draw.rect(WIN, BLACK, frame, 3)
+    slot_rects = get_storage_slot_rects(st_def)
+    contents = st_item.get("contents", [None]*st_def["slots"])
+    for i, rect in enumerate(slot_rects):
+        pygame.draw.rect(WIN, LIGHT_GRAY, rect)
+        pygame.draw.rect(WIN, BLACK, rect, 2)
+        content = contents[i] if i < len(contents) else None
+        if content:
+            img = ITEM_IMAGES.get(content["type"])
+            if img:
+                img_rect = img.get_rect(center=rect.center)
+                WIN.blit(img, img_rect)
 
 # === CRAFTING GUI ===
 crafting_visible = False
@@ -535,9 +844,9 @@ def get_craft_result(inputs):
     elif sorted(input_types) == sorted(["holed_stick", "ashes"]):
         return ["ashed_holed_stick"]
     elif sorted(input_types) == sorted(["ashed_holed_stick", "sharp_rock"]):
-        return ["nonfunctional_stone_axe"]
-    elif sorted(input_types) == sorted(["nonfunctional_stone_axe", "hard_fiber"]):
-        return ["stone_axe"]
+        return ["nonfunctional_stone_hatchet"]
+    elif sorted(input_types) == sorted(["nonfunctional_stone_hatchet", "hard_fiber"]):
+        return ["stone_hatchet"]
     elif sorted(input_types) == sorted(["cotton_boll", "fire_plough"]):
         return ["burning_cotton_boll"]
     elif sorted(input_types) == sorted(["wood_dust", "fire_plough"]):
@@ -550,6 +859,16 @@ def get_craft_result(inputs):
         return ["clay_cup"]
     elif sorted(input_types) == sorted(["clay", "clay"]):
         return ["clay_mold"]
+    elif sorted(input_types) == sorted(["rattan", "rattan"]):
+        return ["weaved_fiber"]
+    elif sorted(input_types) == sorted(["weaved_fiber", "weaved_fiber"]):
+        return ["green_basket"]
+    elif sorted(input_types) == sorted(["weaved_fiber", "rattan"]):
+        return ["green_weaved_cone"]
+    elif sorted(input_types) == sorted(["bamboo", "stone_chisel"]):
+        return ["hollow_bamboo"]
+    elif sorted(input_types) == sorted(["hollow_bamboo", "raw_rope"]):
+        return ["bamboo_bottle"]
     else:
         return []
 
@@ -573,6 +892,8 @@ def get_craft_result_durs(inputs):
         return [["fire_plough", -1]]
     elif sorted(input_types) == sorted(["wood_dust", "fire_plough"]):
         return [["fire_plough", -3]]
+    elif sorted(input_types) == sorted(["bamboo", "stone_chisel"]):
+        return [["stone_chisel", -2]]
     else:
         return []
 
@@ -638,6 +959,569 @@ def perform_craft():
 
     update_craft_output()
 
+# === LOAD ANIMALS IMAGE ===
+ANIMAL_BASE_SIZE = 80
+ANIMAL_PATH = "animals"
+ANIMAL_IMAGES = {
+    "snail": {
+        "animated": False,
+        "image": pygame.image.load(os.path.join(ANIMAL_PATH, "snail.png"))
+    },
+    "cone_snail": {
+        "animated": False,
+        "image": pygame.image.load(os.path.join(ANIMAL_PATH, "cone_snail.png"))
+    },
+    "earthworm": {
+        "animated": True,
+        "frames": [
+            pygame.image.load(os.path.join(ANIMAL_PATH, os.path.join("earthworm", "shortened.png"))),
+            pygame.image.load(os.path.join(ANIMAL_PATH, os.path.join("earthworm", "extended.png")))
+        ],
+        "animation_spf": 2.0 # seconds per frame
+    },
+    "pigeon": {
+        "animated": False,
+        "image": pygame.image.load(os.path.join(ANIMAL_PATH, "pigeon.png"))
+    }
+}
+
+for animal, data in ANIMAL_IMAGES.items():
+    if not data["animated"]:
+        data["image"] = pygame.transform.scale(data["image"], (ANIMAL_BASE_SIZE, ANIMAL_BASE_SIZE))
+    else:
+        for i, frame in enumerate(data["frames"]):
+            data["frames"][i] = pygame.transform.scale(frame, (ANIMAL_BASE_SIZE, ANIMAL_BASE_SIZE))
+
+DEFAULT_ANIMAL_IDLE_TIMER = 5 # seconds when an animal that is goes_idle-True arrives at their target
+DEFAULT_ANIMAL_WANDER_RADIUS = 10 # the radius in tiles an animal can when picking a random tile to target
+DEFAULT_ANIMAL_PATIENCE = 10 # in seconds, if the animal can't reach the tile in time
+# animals have patience, if their patience is lost (patience in seconds <= 0) while going to a tile, they pick another tile
+# when picking a tile: if (they can't find a thing from their convert_plant, convert_item, or convert_animal) or (they are not hungry) or (can't find a tile from convert_tile), pick a random tile to go to
+# same thing happens when they reach their target tile
+ANIMAL_PROPS = {
+    "snail": {
+        "goes_idle": False,
+        "max_health": 10,
+        "max_hunger": 10,
+        "heal_speed": 1, # per 10 secs
+        "heal_threshold": 6, # hunger before healing
+        "hunger_decay": 1, # per 30 secs
+        "move_speed": 3, # pixels per second
+        "convert_plant": {
+            "mung_bean": {
+                "edible_stages": ["v1", "v2", "v3", "v6", "fruited"],
+                "plant_damage": 1, # damage to plant
+                "item_converts": None,
+                "heal": 2,
+                "hunger": 2,
+                "animal_damage": 0, # damage to animal
+                "eating_duration": 5, # seconds before the plant disappears
+                "move_stop": True, # stops animal from moving while eating
+            }
+        },
+        "convert_item": {
+            "carrot": {
+                "item_converts": None,
+                "heal": 0,
+                "hunger": 4,
+                "animal_damage": 0,
+                "eating_duration": 6,
+                "move_stop": True,
+            }
+        },
+        "convert_tile": {},
+        "convert_animal": {}, # interaction with other animals
+        "death_drop": [],
+        "pickup_item": None
+    },
+    "earthworm": {
+        "goes_idle": False,
+        "max_health": 5,
+        "max_hunger": 10,
+        "heal_speed": 2, 
+        "heal_threshold": 4,
+        "hunger_decay": 1,
+        "move_speed": 30, 
+        "sine_movement": { # oscillating speed
+            "min_move_speed": 10,
+            "sine_speed": 10 # pixel per frame (multiplied by dt)
+        },
+        "convert_plant": {
+            "mung_bean": {
+                "edible_stages": ["ve", "v1", "v2", "v3"],
+                "plant_damage": 1,
+                "item_converts": "earthworm_waste",
+                "heal": 0,
+                "hunger": 2,
+                "animal_damage": 0,
+                "eating_duration": 5,
+                "move_stop": False,
+            }
+        },
+        "convert_item": {
+            "carrot": {
+                "item_converts": "earthworm_waste",
+                "heal": 0,
+                "hunger": 4,
+                "animal_damage": 0,
+                "eating_duration": 6,
+                "move_stop": True,
+            }
+        },
+        "convert_tile": {
+            "grass": {
+                "tile_into": "earthworm_dirt",
+                "when": {
+                    "seconds": 0,
+                    "after_timer": False,
+                    "after_damaged": True,
+                    "of_being_alive": False,
+                    "of_being_dead": False,
+                    "of_eating": False,
+                    "of_near_player": {
+                        "radius": 0,
+                        "does": False
+                    }
+                },
+                "animal_disappears": True
+            }
+        },
+        "convert_animal": {},
+        "death_drop": [],
+        "pickup_item": "earthworm"
+    },
+    "cone_snail": {
+        "goes_idle": False,
+        "max_health": 10,
+        "max_hunger": 10,
+        "heal_speed": 1,
+        "heal_threshold": 5,
+        "hunger_decay": 1,
+        "move_speed": 5,
+        "convert_plant": {},
+        "convert_item": {},
+        "convert_animal": {},
+        "convert_tile": {},
+        "death_drop": [],
+        "pickup_item": None
+    },
+    "pigeon": {
+        "goes_idle": True,
+        "max_health": 30,
+        "max_hunger": 30,
+        "heal_speed": 1,
+        "heal_threshold": 10,
+        "hunger_decay": 2,
+        "move_speed": 40,
+        "convert_plant": {},
+        "convert_item": {
+            "mung_beans": {
+                "item_converts": None,
+                "heal": 0,
+                "hunger": 4,
+                "animal_damage": 0,
+                "eating_duration": 1,
+                "move_stop": True,
+            },
+            "cotton_seed": {
+                "item_converts": None,
+                "heal": 0,
+                "hunger": 4,
+                "animal_damage": 0,
+                "eating_duration": 1,
+                "move_stop": True,
+            },
+        },
+        "convert_tile": {},
+        "convert_animal": {
+            "earthworm": {
+                "target_damage": 3, # damage to target
+                "target_dead": { # when target dies
+                    "heal": 0,
+                    "hunger": 7,
+                    "animal_damage": 0,
+                    "target_drop_cancel": True, # sets if the prey doesn't drop something
+                },
+            }
+        },
+        "death_drop": [],
+        "pickup_item": None # None means it can't be picked up
+    }
+}
+
+def spawn_animal(animal_type, x, y):
+    """Create a new animal instance."""
+    props = ANIMAL_PROPS[animal_type]
+    return {
+        "type": animal_type,
+        "x": x,
+        "y": y,
+        "health": props["max_health"],
+        "hunger": props["max_hunger"],
+        "target": None,
+        "patience": DEFAULT_ANIMAL_PATIENCE,
+        "frame": 0,  # for animated animals
+        "frame_timer": 0,  # for animated animals
+        "sine_offset": random.random() * math.tau,  # for oscillating movement
+        "last_tile_convert_time": 0,  # for tile conversion tracking
+        "state_timer": 0,
+        "texture_angle": 0
+    }
+
+def update_animals(dt):
+    """Update all animals' states using full ANIMAL_PROPS capabilities."""
+    for animal in animals[:]:  # Use slice to allow removal during iteration
+        props = ANIMAL_PROPS[animal["type"]]
+
+        # --- Idle / wander behavior ---
+        if animal.get("target") is None:
+            if props.get("goes_idle", False):
+                # stays idle for a while before picking a new target
+                animal["state"] = "idle"
+                animal["state_timer"] += dt
+                if animal["state_timer"] >= DEFAULT_ANIMAL_IDLE_TIMER:
+                    animal["state_timer"] = 0
+                    # pick a new random nearby point
+                    angle = random.uniform(0, 2*math.pi)
+                    dist = random.uniform(20, DEFAULT_ANIMAL_WANDER_RADIUS * TILE_SIZE)
+                    animal["target"] = {"type": "position", "ref": (
+                        animal["x"] + math.cos(angle)*dist,
+                        animal["y"] + math.sin(angle)*dist
+                    )}
+                    animal["state"] = "moving"
+            else:
+                # immediately wander again (never idles)
+                angle = random.uniform(0, 2*math.pi)
+                dist = random.uniform(20, DEFAULT_ANIMAL_WANDER_RADIUS * TILE_SIZE)
+                animal["target"] = {"type": "position", "ref": (
+                    animal["x"] + math.cos(angle)*dist,
+                    animal["y"] + math.sin(angle)*dist
+                )}
+                animal["state"] = "moving"
+        
+        # --- Initialize runtime fields ---
+        if "state" not in animal:
+            animal["state"] = "idle"
+            animal["state_timer"] = 0.0
+            animal["target"] = None
+            animal["patience"] = DEFAULT_ANIMAL_PATIENCE
+            
+        # --- Update basic stats ---
+        # Hunger decay
+        animal["hunger"] = max(0, animal["hunger"] - props.get("hunger_decay", 0) * dt / 30.0)
+        
+        # Healing when above threshold
+        if animal["hunger"] >= props.get("heal_threshold", 0):
+            animal["health"] = min(props["max_health"], 
+                                 animal["health"] + props.get("heal_speed", 0) * dt / 10.0)
+        
+        # --- Death check ---
+        if animal["hunger"] <= 0:
+            animal["health"] -= props.get("hunger_decay", 0) * dt / 30.0
+
+        if animal["health"] <= 0 and not animal.get("recently_damaged", False):
+            # Spawn death drops
+            for item_type in props.get("death_drop", []):
+                items.append({
+                    "type": item_type,
+                    "x": animal["x"] + random.randint(-20, 20),
+                    "y": animal["y"] + random.randint(-20, 20)
+                })
+            animals.remove(animal)
+            continue
+
+        # --- Handle idle timers to restart wandering ---
+        if animal["state"] == "idle":
+            animal["state_timer"] += dt
+            if animal["state_timer"] >= DEFAULT_ANIMAL_IDLE_TIMER:
+                animal["state_timer"] = 0
+                # choose new random wander target
+                angle = random.uniform(0, 2 * math.pi)
+                dist = random.uniform(20, DEFAULT_ANIMAL_WANDER_RADIUS * TILE_SIZE)
+                animal["target"] = {"type": "position", "ref": (
+                    animal["x"] + math.cos(angle) * dist,
+                    animal["y"] + math.sin(angle) * dist
+                )}
+                animal["state"] = "moving"
+            
+        # --- Target selection ---
+        animal["patience"] -= dt
+        if (animal["state"] == "idle" or 
+            animal["patience"] <= 0 or 
+            animal["target"] is None):
+            
+            # Reset state
+            animal["target"] = None
+            animal["patience"] = DEFAULT_ANIMAL_PATIENCE
+            # Give up on old target and wander again
+            angle = random.uniform(0, 2 * math.pi)
+            dist = random.uniform(20, DEFAULT_ANIMAL_WANDER_RADIUS * TILE_SIZE)
+            animal["target"] = {"type": "position", "ref": (
+                animal["x"] + math.cos(angle) * dist,
+                animal["y"] + math.sin(angle) * dist
+            )}
+            animal["state"] = "moving"
+            
+            # Find nearest target based on priorities
+            best_target = None
+            search_radius = DEFAULT_ANIMAL_WANDER_RADIUS * TILE_SIZE
+            
+            # 1. Check for plants to eat
+            if props.get("convert_plant"):
+                for plant in plants:
+                    if plant["type"] in props["convert_plant"]:
+                        conv = props["convert_plant"][plant["type"]]
+                        if plant["growth_stage"] in conv.get("edible_stages", []):
+                            dist = math.hypot(plant["x"] - animal["x"], 
+                                           plant["y"] - animal["y"])
+                            if dist <= search_radius:
+                                if not best_target or dist < best_target[0]:
+                                    best_target = (dist, "plant", plant)
+            
+            # 2. Check for items to consume
+            if not best_target and props.get("convert_item"):
+                for item in items:
+                    if item["type"] in props["convert_item"]:
+                        dist = math.hypot(item["x"] - animal["x"],
+                                        item["y"] - animal["y"])
+                        if dist <= search_radius:
+                            if not best_target or dist < best_target[0]:
+                                best_target = (dist, "item", item)
+            
+            # 3. Check for prey animals
+            if not best_target and props.get("convert_animal"):
+                for other in animals:
+                    if other is not animal and other["type"] in props["convert_animal"]:
+                        dist = math.hypot(other["x"] - animal["x"],
+                                        other["y"] - animal["y"])
+                        if dist <= search_radius:
+                            if not best_target or dist < best_target[0]:
+                                best_target = (dist, "animal", other)
+            
+            # Set target or wander
+            if best_target:
+                _, ttype, target = best_target
+                animal["target"] = {"type": ttype, "ref": target}
+                animal["state"] = "moving"
+            else:
+                # Random wandering
+                angle = random.random() * math.tau
+                dist = random.uniform(0, search_radius)
+                animal["target"] = {
+                    "type": "position",
+                    "ref": (animal["x"] + math.cos(angle) * dist,
+                           animal["y"] + math.sin(angle) * dist)
+                }
+                animal["state"] = "moving"
+        
+        # --- Animate frame if applicable ---
+        imgdata = ANIMAL_IMAGES[animal["type"]]
+        if imgdata.get("animated", False):
+            spf = imgdata.get("animation_spf", 1.0)  # seconds per frame
+            animal["frame_timer"] += dt
+            if animal["frame_timer"] >= spf:
+                animal["frame_timer"] = 0
+                animal["frame"] = (animal["frame"] + 1) % len(imgdata["frames"])
+
+        # --- Movement ---
+        if animal["state"] == "moving":
+            # Get target position
+            tx, ty = None, None
+            if animal["target"]["type"] == "position":
+                tx, ty = animal["target"]["ref"]
+            else:
+                target = animal["target"]["ref"]
+                tx, ty = target["x"], target["y"]
+            
+            if tx is not None and ty is not None:
+                # Calculate movement
+                dx = tx - animal["x"]
+                dy = ty - animal["y"]
+                dist = math.hypot(dx, dy)
+
+                if dist < 5:
+                    animal["state"] = "arrived"
+                    continue  # Prevent jitter/spin
+
+                if dist > 5:  # Distance threshold
+                    # Base movement speed
+                    speed = props.get("move_speed", 0)
+                    
+                    # Apply sine movement if configured
+                    if "sine_movement" in props:
+                        sine = props["sine_movement"]
+                        base = sine.get("min_move_speed", speed)
+                        amp = sine.get("sine_speed", 0)
+                        speed = base + abs(math.sin(time.time() + animal["sine_offset"])) * (amp * 0.3)
+                    
+                    # Move
+                    vx = (dx / dist) * speed * dt
+                    vy = (dy / dist) * speed * dt
+                    animal["x"] += vx
+                    animal["y"] += vy
+                    
+                    if dist > 1:  # update facing only if actually moving
+                        animal["texture_angle"] = math.degrees(math.atan2(dy, dx))
+                else:
+                    # Reached target
+                    animal["state"] = "arrived"
+                    
+        # --- Handle arrival at target ---
+        if animal["state"] == "arrived":
+            if animal["target"]["type"] == "plant":
+                # Start eating plant
+                animal["state"] = "eating"
+                conv = props["convert_plant"][animal["target"]["ref"]["type"]]
+                animal["state_timer"] = conv.get("eating_duration", 1.0)
+            elif animal["target"]["type"] == "item":
+                # Start eating item
+                animal["state"] = "eating"
+                conv = props["convert_item"][animal["target"]["ref"]["type"]]
+                animal["state_timer"] = conv.get("eating_duration", 1.0)
+            elif animal["target"]["type"] == "animal":
+                # Start attack
+                animal["state"] = "attacking"
+                animal["state_timer"] = 0.5  # Attack windup
+
+        # --- Animal vs Animal interactions ---
+        for other in animals:
+            if other is animal:
+                continue
+            if other["health"] <= 0:
+                continue
+
+            # Check if this animal can attack the other
+            if other["type"] in props.get("convert_animal", {}):
+                interaction = props["convert_animal"][other["type"]]
+
+                dx = other["x"] - animal["x"]
+                dy = other["y"] - animal["y"]
+                dist = math.hypot(dx, dy)
+
+                # You can define a default attack range (e.g., 30 px)
+                if dist <= 30:
+                    # Apply damage to the target
+                    dmg = interaction.get("target_damage", 0)
+                    animal["attack_timer"] = animal.get("attack_timer", 0) - dt
+                    if dmg > 0 and animal["attack_timer"] <= 0:
+                        other["health"] -= dmg
+                        other["recently_damaged"] = True
+
+                        # Check if the target dies
+                        if other["health"] <= 0:
+                            td = interaction.get("target_dead", {})
+                            # Heal or feed predator
+                            animal["health"] = min(
+                                animal["health"] + td.get("heal", 0),
+                                props.get("max_health", 10),
+                            )
+                            animal["hunger"] = min(
+                                animal["hunger"] + td.get("hunger", 0),
+                                props.get("max_hunger", 10),
+                            )
+
+                            # Cancel prey's death drop if specified
+                            if td.get("target_drop_cancel", False):
+                                other["death_drop"] = []
+                            # Remove prey from world
+                            animals.remove(other)
+                        animal["attack_timer"] = 1.0
+                    break  # only attack one target per frame
+
+            dx = animal["x"] - other["x"]
+            dy = animal["y"] - other["y"]
+            dist = math.hypot(dx, dy)
+
+            # Define collision radius — tweak per animal type if needed
+            radius = (props.get("collision_radius", 10) +
+                    ANIMAL_PROPS[other["type"]].get("collision_radius", 10))
+
+            if dist < radius and dist > 0:
+                # Overlapping — compute push-out vector
+                overlap = radius - dist
+                nx = dx / dist
+                ny = dy / dist
+
+                # Push both animals apart slightly
+                animal["x"] += nx * overlap * 0.5
+                animal["y"] += ny * overlap * 0.5
+                other["x"]  -= nx * overlap * 0.5
+                other["y"]  -= ny * overlap * 0.5
+
+        # --- Animal vs Plant collision ---
+        for plant in plants:
+            plant_type = plant["type"]
+            if not PLANT_STATS.get(plant_type, {}).get("can_collide", False):
+                continue
+
+            # Assume plants have center position (plant["x"], plant["y"])
+            # If they’re tile-based, you can compute from tile index instead.
+            dx = animal["x"] - plant["x"]
+            dy = animal["y"] - plant["y"]
+            dist = math.hypot(dx, dy)
+
+            # Define collision radii
+            plant_radius = PLANT_STATS[plant_type].get("collision_radius", PLANT_SIZE / 2)
+            animal_radius = props.get("collision_radius", 10)
+            radius = plant_radius + animal_radius
+
+            if dist < radius and dist > 0:
+                overlap = radius - dist
+                nx = dx / dist
+                ny = dy / dist
+
+                # Push animal outward only (plants are static)
+                animal["x"] += nx * overlap
+                animal["y"] += ny * overlap
+
+        # --- Handle eating state ---
+        if animal["state"] == "eating":
+            animal["state_timer"] -= dt
+            if animal["state_timer"] <= 0:
+                target = animal["target"]
+                if target["type"] == "plant":
+                    plant = target["ref"]
+                    conv = props["convert_plant"][plant["type"]]
+                    # Apply damage and effects
+                    plant["health"] -= conv.get("plant_damage", 0)
+                    animal["health"] = min(props["max_health"], 
+                                         animal["health"] + conv.get("heal", 0))
+                    animal["hunger"] = min(props["max_hunger"],
+                                         animal["hunger"] + conv.get("hunger", 0))
+                    
+                    # Convert/remove plant
+                    if plant["health"] <= 0:
+                        if plant in plants:
+                            plants.remove(plant)
+                            
+                    # Spawn conversion item
+                    if conv.get("item_converts"):
+                        items.append({
+                            "type": conv["item_converts"],
+                            "x": plant["x"] + random.randint(-10, 10),
+                            "y": plant["y"] + random.randint(-10, 10)
+                        })
+                
+                elif target["type"] == "item":
+                    item = target["ref"]
+                    conv = props["convert_item"][item["type"]]
+                    # Apply effects
+                    animal["health"] = min(props["max_health"],
+                                         animal["health"] + conv.get("heal", 0))
+                    animal["hunger"] = min(props["max_hunger"],
+                                         animal["hunger"] + conv.get("hunger", 0))
+                    
+                    # Convert/remove item
+                    if conv.get("item_converts"):
+                        item["type"] = conv["item_converts"]
+                    else:
+                        if item in items:
+                            items.remove(item)
+                
+                # Reset state
+                animal["state"] = "idle"
+                animal["target"] = None
+                
 # === LOAD STRUCTURES IMAGE ===
 STRUCTURE_SIZE = 80
 STRUCTURE_PATH = "structures"
@@ -672,14 +1556,38 @@ STRUCTURE_ITEM_INTERACTIONS = {
         }
     }
 }
+STRUCTURE_STATS = {
+    "burning_sticks_pile": {
+        "max_health": 20,
+        "heal": {
+            "when": [],
+            "heal": 0
+        }
+    },
+    "fire_place": {
+        "max_health": 30,
+        "heal": {
+            "when": ["refueled"],
+            "heal": 30
+        }
+    },
+}
 STRUCTURE_SPECIALS = {
     "burning_sticks_pile": {
+        "mined_with": {
+            "stone_hatchet": {"damage": 10, "dur_damage": 2}
+        },
+        "broken_drop": ["ashes", "ashes", "charcoal"],
         "light_radius": 3, # Tiles
         "light_intensity": 1, # starting intensity; max intensity = light_radius
         "light_flickering": [0.5, 1, 2], # [timer_secs, min_intensity, max_intensity]
-        "timer_convertion": [20, ["ashes", "ashes", "ashes"], []] # [timer_secs, items_convert, structures_convert]
+        "timer_convertion": [90, ["ashes", "ashes", "ashes"], []] # [timer_secs, items_convert, structures_convert]
     },
     "fire_place": {
+        "mined_with": {
+            "stone_hatchet": {"damage": 5, "dur_damage": 2}
+        },
+        "broken_drop": ["ashes", "ashes", "charcoal", "ashes", "charcoal"],
         "light_radius": 10, 
         "light_intensity": 5,
         "light_flickering": [0.2, 1, 6],
@@ -827,27 +1735,125 @@ def update_structures(dt):
                             else:
                                 items.remove(item)
 
-def handle_cooking(structure, item):
-    """Handle cooking items in structures that support it."""
+def handle_cooking(structure, item, dt):
+    """Handle cooking items in structures that support it. dt is seconds since last frame."""
     if structure["type"] in STRUCTURE_SPECIALS:
         specs = STRUCTURE_SPECIALS[structure["type"]]
         
         if "cooks" in specs and item["type"] in specs["cooks"]:
             cook_data = specs["cooks"][item["type"]]
             
-            # Initialize cooking timer
+            # Initialize cooking timer (in seconds)
             if "cook_timer" not in item:
-                item["cook_timer"] = cook_data["timer"]
+                item["cook_timer"] = float(cook_data["timer"])
             
-            item["cook_timer"] -= 1
+            # decrement in seconds
+            item["cook_timer"] -= dt
             
             # Convert item when done cooking
             if item["cook_timer"] <= 0:
                 item["type"] = cook_data["cooks_into"]
+                if item["type"] in MAX_ITEM_DUR:
+                    item["dur"] = MAX_ITEM_DUR[item["type"]]
                 del item["cook_timer"]
                 return True
     
     return False
+
+# --- START: NEW ANIMATION / TOOL ACTION QUEUE ---
+pending_animations = []  # list of dicts representing current animations
+
+def start_tool_animation(tool_slot, action, tool_item, tile_x=None, tile_y=None, target_plant=None):
+    """Queue a mining/chop animation. action = 'mine' or 'chop'.
+    This version prevents starting a new animation if one is already running."""
+    if not tool_item:
+        return
+    # If any animation is running, ignore new requests
+    if pending_animations:
+        return
+    
+    target_x = target_plant["x"] if target_plant is not None else tile_x
+    target_y = target_plant["y"] if target_plant is not None else tile_y
+    if target_x is not None and target_y is not None:
+        dx = player_center_x - target_x
+        dy = player_center_y - target_y
+        dist = math.sqrt(dx**2 + dy**2)
+        if dist > player_size * 1.3:
+            return
+    else:
+        return 
+
+    # small durations; hit_time is when the effect is applied
+    duration = 0.6 if action == "mine" else 0.5
+    hit_time = duration * 0.45
+
+    # Capture current mouse angle relative to player center so swing is stable
+    mx, my = pygame.mouse.get_pos()
+    px, py = WIDTH // 2, HEIGHT // 2  # player is rendered at screen center
+    dx = mx - px
+    dy = my - py
+    base_angle = math.degrees(math.atan2(dy, dx))  # degrees
+
+    # define arc: sweep around base_angle. tweak arc_width for bigger/smaller swings
+    arc_width = 90
+    start_angle = base_angle - arc_width * 0.6
+    end_angle = base_angle + arc_width * 0.4
+
+    anim = {
+        "tool_slot": tool_slot,
+        "tool_item": tool_item,
+        "action": action,
+        "tile_x": tile_x,
+        "tile_y": tile_y,
+        "target_plant": target_plant,
+        "duration": duration,
+        "elapsed": 0.0,
+        "hit_applied": False,
+        "particles": [],
+        # swing profile
+        "swing": {
+            "start_angle": start_angle,
+            "end_angle": end_angle,
+            "radius": player_size // 2 + 18  # distance from player center to tool pivot
+        }
+    }
+    pending_animations.append(anim)
+
+def update_animations(dt):
+    """Progress animations, apply tool effects at hit frame."""
+    for anim in pending_animations[:]:
+        anim["elapsed"] += dt
+        # Apply hit effects once at hit_time
+        hit_time = anim["duration"] * 0.45
+        if not anim["hit_applied"] and anim["elapsed"] >= hit_time:
+            # Call your existing handler to actually produce drops / change tiles / dur
+            tool_item = anim["tool_item"]
+            slot = anim["tool_slot"]
+            if anim["action"] == "mine":
+                # ensure tile still known
+                tile = get_current_tile(anim["tile_x"], anim["tile_y"])
+                if tile is not None:
+                    keep_target, keep_tool = handle_tool_action(tool_item, tile, None, anim["tile_x"], anim["tile_y"])
+                    if not keep_tool:
+                        if 0 <= slot < len(inventory) and inventory[slot] is tool_item:
+                            inventory[slot] = None
+            elif anim["action"] == "chop":
+                plant = anim["target_plant"]
+                if plant in plants:
+                    keep_target, keep_tool = handle_tool_action(tool_item, None, plant, None, None)
+                    if not keep_target and plant in plants:
+                        try:
+                            plants.remove(plant)
+                        except ValueError:
+                            pass
+                    if not keep_tool:
+                        if 0 <= slot < len(inventory) and inventory[slot] is tool_item:
+                            inventory[slot] = None
+            anim["hit_applied"] = True
+
+        # remove finished animations
+        if anim["elapsed"] >= anim["duration"]:
+            pending_animations.remove(anim)
 
 # === PERFORMANCE FUNCTIONS ===
 def unload_far_entities(player_x, player_y, max_distance=CHUNK_SIZE*TILE_SIZE*3):
@@ -877,40 +1883,121 @@ def find_spawn_location(search_radius=10):
     # fallback if somehow all water
     return (0, 0)
 
-def get_tile_at(x, y):
-    """Return the tile type at world coordinate (x, y) in pixels."""
-    # Convert from pixel coordinates to tile coordinates
-    tile_x = int(x // TILE_SIZE)
-    tile_y = int(y // TILE_SIZE)
+def get_current_tile(tile_x, tile_y):
+    # compute chunk coords using floor division so negatives map correctly
+    chunk_x = math.floor(tile_x / CHUNK_SIZE)
+    chunk_y = math.floor(tile_y / CHUNK_SIZE)
+    local_x = tile_x - chunk_x * CHUNK_SIZE
+    local_y = tile_y - chunk_y * CHUNK_SIZE
 
-    # Determine which chunk that tile belongs to
-    chunk_x = tile_x // CHUNK_SIZE
-    chunk_y = tile_y // CHUNK_SIZE
+    # If chunk isn't loaded, do NOT generate it — return None to indicate "unknown/unloaded"
+    if (chunk_x, chunk_y) not in world_chunks:
+        return None
 
-    # Determine the tile’s local position within the chunk
-    local_x = tile_x % CHUNK_SIZE
-    local_y = tile_y % CHUNK_SIZE
-
-    # Handle negative coordinates properly (Python’s % works differently for negatives)
-    if local_x < 0:
-        local_x += CHUNK_SIZE
-        chunk_x -= 1
-    if local_y < 0:
-        local_y += CHUNK_SIZE
-        chunk_y -= 1
-
-    # Load or retrieve the chunk
-    chunk = get_chunk(chunk_x, chunk_y)
-
-    # Return the tile type
+    chunk = world_chunks[(chunk_x, chunk_y)]
     return chunk[local_y][local_x]
 
 # === DRAW FUNCTIONS ===
+def draw_animations(camera_x, camera_y, dt):
+    """Draw simple procedural animations (flash + particles) and a tool swing in front of the player."""
+    for anim in pending_animations:
+        progress = anim["elapsed"] / max(0.0001, anim["duration"])
+        # draw the existing particle/flash effects
+        if anim["action"] == "mine":
+            wx = anim["tile_x"] * TILE_SIZE + TILE_SIZE // 2
+            wy = anim["tile_y"] * TILE_SIZE + TILE_SIZE // 2
+            sx = int(wx - camera_x)
+            sy = int(wy - camera_y)
+            radius = int(18 + 24 * (1 - abs(progress*2 - 1)))
+            alpha = int(200 * (1 - progress))
+            surf = pygame.Surface((radius*2+4, radius*2+4), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 220, 120, alpha), (radius+2, radius+2), radius)
+            WIN.blit(surf, (sx - radius - 2, sy - radius - 2))
+            if not anim["particles"]:
+                for i in range(10):
+                    ang = random.random() * math.tau
+                    speed = random.uniform(60, 160)
+                    anim["particles"].append({
+                        "x": sx, "y": sy,
+                        "vx": math.cos(ang) * speed,
+                        "vy": math.sin(ang) * speed,
+                        "life": random.uniform(0.25, 0.6)
+                    })
+            for p in anim["particles"][:]:
+                p["x"] += p["vx"] * dt
+                p["y"] += p["vy"] * dt
+                p["life"] -= dt
+                alpha = int(255 * max(0, min(1, p["life"] / 0.6)))
+                pygame.draw.circle(WIN, (200,200,200,alpha), (int(p["x"]), int(p["y"])), 2)
+                if p["life"] <= 0:
+                    anim["particles"].remove(p)
+
+        elif anim["action"] == "chop":
+            plant = anim["target_plant"]
+            if plant:
+                sx = int(plant["x"] - camera_x)
+                sy = int(plant["y"] - camera_y)
+                radius = int(14 + 18 * (1 - abs(progress*2 - 1)))
+                surf = pygame.Surface((radius*2+4, radius*2+4), pygame.SRCALPHA)
+                pygame.draw.circle(surf, (180, 240, 180, int(180*(1-progress))), (radius+2, radius+2), radius)
+                WIN.blit(surf, (sx - radius - 2, sy - radius - 2))
+                if not anim["particles"]:
+                    for i in range(8):
+                        ang = random.random() * math.tau
+                        speed = random.uniform(40, 120)
+                        anim["particles"].append({
+                            "x": sx, "y": sy,
+                            "vx": math.cos(ang) * speed,
+                            "vy": math.sin(ang) * speed,
+                            "life": random.uniform(0.25, 0.5)
+                        })
+                for p in anim["particles"][:]:
+                    p["x"] += p["vx"] * dt
+                    p["y"] += p["vy"] * dt
+                    p["life"] -= dt
+                    pygame.draw.circle(WIN, (150, 100, 60), (int(p["x"]), int(p["y"])), 2)
+                    if p["life"] <= 0:
+                        anim["particles"].remove(p)
+
+        # DRAW TOOL SWING in front of player (for mine/chop actions)
+        if anim["action"] in ("mine", "chop") and anim.get("tool_item"):
+            swing = anim.get("swing", None)
+            tool = anim["tool_item"]
+            tool_img = ITEM_IMAGES.get(tool["type"])
+            if swing and tool_img:
+                t = max(0.0, min(1.0, progress))
+                # easing for a nicer arc (fast middle)
+                eased = math.sin(t * math.pi)
+                angle = swing["start_angle"] + (swing["end_angle"] - swing["start_angle"]) * eased
+
+                # compute screen pivot (player drawn at center)
+                player_cx = WIDTH // 2
+                player_cy = HEIGHT // 2
+
+                r = swing.get("radius", player_size // 2 + 18)
+                ox = math.cos(math.radians(angle)) * r
+                oy = math.sin(math.radians(angle)) * r
+
+                # rotate tool sprite so it follows the arc
+                # adjust by -90 so sprite points along sweep direction (tweak as needed)
+                rotated = pygame.transform.rotate(tool_img, -angle - 90)
+                rect = rotated.get_rect(center=(player_cx + ox, player_cy + oy))
+
+                # Optional: fade tool slightly as animation finishes
+                # create temp surface to set alpha without changing original
+                temp = rotated.copy()
+                alpha_val = int(255 * (1 - 0.2 * t))
+                temp.set_alpha(alpha_val)
+                WIN.blit(temp, rect.topleft)
+
 def draw_inventory():
     slot_rects = get_inventory_slot_rects()
     for i, rect in enumerate(slot_rects):
         pygame.draw.rect(WIN, LIGHT_GRAY, rect)
         pygame.draw.rect(WIN, BLACK, rect, 2)
+        text = font.render(f"{i+1}", True, WHITE)
+        text_rect = text.get_rect(center=rect.center)
+        WIN.blit(text, text_rect.topleft)
         if inventory[i]:
             img = ITEM_IMAGES[inventory[i]["type"]]
             img_rect = img.get_rect(center=rect.center)
@@ -1020,8 +2107,13 @@ def update_structure_lighting():
                 intensity = specs["light_intensity"]
                 if "light_flickering" in specs:
                     timer, min_int, max_int = specs["light_flickering"]
-                    flicker = math.sin(time.time() / timer) * (max_int - min_int) / 2
+                    # Combine sine wave with random noise for natural flicker
+                    base_flicker = math.sin(time.time() / timer)
+                    noise = random.uniform(-0.3, 0.3)  # Add random variation
+                    flicker = (base_flicker + noise) * (max_int - min_int) / 2
                     intensity = min_int + (max_int - min_int) / 2 + flicker
+                    # Clamp intensity to valid range
+                    intensity = max(min_int, min(max_int, intensity))
                 
                 active_lights.append({
                     "x": structure["x"],
@@ -1055,11 +2147,8 @@ def draw_lighting(camera_x, camera_y):
     
     # Draw light circles for each light source
     for light in active_lights:
-        # Convert world position to screen position
         screen_x = int(light["x"] - camera_x)
         screen_y = int(light["y"] - camera_y)
-        
-        # Create light gradient
         radius = int(light["radius"])
         intensity = light["intensity"]
         
@@ -1067,13 +2156,31 @@ def draw_lighting(camera_x, camera_y):
         steps = 10
         for i in range(steps):
             current_radius = radius * (1 - i/steps)
-            alpha = int(255 * (intensity/steps) * (1 - i/steps))
-            pygame.draw.circle(LIGHT_SURFACE, (255, 200, 100, alpha),
+            alpha = int(100 * (intensity/steps) * (1 - i/steps))
+            # Use inverse colors for subtractive blending
+            pygame.draw.circle(LIGHT_SURFACE, (0, 5, 15, 255-alpha),
                              (screen_x + STRUCTURE_SIZE//2, screen_y + STRUCTURE_SIZE//2), 
                              int(current_radius))
     
-    # Blit the light surface using alpha blending
+    # Blit with subtractive blending
     WIN.blit(LIGHT_SURFACE, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
+
+def draw_animals(camera_x, camera_y):
+    """Draw all animals on screen."""
+    for animal in animals:
+        screen_x = animal["x"] - camera_x
+        screen_y = animal["y"] - camera_y
+        
+        if ANIMAL_IMAGES[animal["type"]]["animated"]:
+            frames = ANIMAL_IMAGES[animal["type"]]["frames"]
+            img = frames[animal["frame"]]
+        else:
+            img = ANIMAL_IMAGES[animal["type"]]["image"]
+
+        img = pygame.transform.rotate(img, -animal["texture_angle"]-90)
+            
+        img_rect = img.get_rect(center=(screen_x, screen_y))
+        WIN.blit(img, img_rect.topleft)
 
 # === MAIN LOOP ===
 player_x, player_y = find_spawn_location()
@@ -1081,12 +2188,26 @@ paused = False
 dead = False
 
 items.append({"type": "ceramic_cup", "x": player_x, "y": player_y})
+items.append({"type": "stone_hatchet", "x": player_x, "y": player_y, "dur": 50})
+
+structures.append({"type": "fire_place", "x": player_x-500, "y": player_y-500, "timer": 500})
 
 shown_info = None
 shown_button = pygame.Rect(0,0,0,0)
 
+hitboxes = False
+
 running = True
 while running:
+    for item in items:
+        item["entity"] = "item"
+
+    for plant in plants:
+        plant["entity"] = "plant"
+
+    for structure in structures:
+        structure["entity"] = "structure"
+
     dt = clock.tick(60) / 1000
     mouse_pos = pygame.mouse.get_pos()
     world_mouse_x = mouse_pos[0] + (player_x - WIDTH // 2)
@@ -1103,6 +2224,7 @@ while running:
         last_items_count = total_items
         last_structures_count = total_structs
 
+# event_here
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -1125,6 +2247,8 @@ while running:
                                         inventory[j] = craft_slots[i]
                                         craft_slots[i] = None
                                         break
+                elif event.key == pygame.K_F3:
+                    hitboxes = not hitboxes
                 elif event.key == pygame.K_h: # Harvest a plant
                     for plant in plants[:]:
                         plant_rect = pygame.Rect(plant["x"], plant["y"], PLANT_SIZE, PLANT_SIZE)
@@ -1154,14 +2278,151 @@ while running:
                     structures.append(get_structure(output_structure, place_x, place_y))
                     structure_crafting_slots = [None, None]
                     update_structure_gui()
+                keys = pygame.key.get_pressed()
+                if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] and not (crafting_structures_visible or crafting_visible):
+                    if event.key == pygame.K_1 and inventory[0] is not None:
+                        item = inventory[0]
+                        inventory[0] = None
+                        item["x"] = player_x
+                        item["y"] = player_y
+                        items.append(item)
+                    elif event.key == pygame.K_2 and inventory[1] is not None:
+                        item = inventory[1]
+                        inventory[1] = None
+                        item["x"] = player_x
+                        item["y"] = player_y
+                        items.append(item)
+                elif not (crafting_structures_visible or crafting_visible):
+                    if event.key == pygame.K_1 and inventory[0] is not None:
+                        item = inventory[0]
+                        name = item["type"]
+                        if name in FOOD_STATS:
+                            food = FOOD_STATS[name]
+                            hunger = min(MAX_HUNGER, hunger + food["hunger"])
+                            thirst = max(0, min(MAX_THIRST, thirst + food["thirst"]))
+                            stamina = min(MAX_STAMINA, stamina + food["stamina"])
+                            # remove eaten item
+                            if inventory[0] and inventory[0]["type"] == name:
+                                food_converts = FOOD_CONVERTS[inventory[0]["type"]]
+                                if food_converts is not None:
+                                    inventory[0]["type"] = food_converts
+                                    shown_info = None
+                                else:
+                                    inventory[0] = None
+                                break
+                        elif name in STORAGE_ITEMS:
+                            if storage_open is not None:
+                                storage_open = None
+                            else:
+                                open_storage(0)
+                    elif event.key == pygame.K_2 and inventory[1] is not None:
+                        item = inventory[1]
+                        name = item["type"]
+                        if name in FOOD_STATS:
+                            food = FOOD_STATS[name]
+                            hunger = min(MAX_HUNGER, hunger + food["hunger"])
+                            thirst = max(0, min(MAX_THIRST, thirst + food["thirst"]))
+                            stamina = min(MAX_STAMINA, stamina + food["stamina"])
+                            # remove eaten item
+                            if inventory[1] and inventory[1]["type"] == name:
+                                food_converts = FOOD_CONVERTS[inventory[1]["type"]]
+                                if food_converts is not None:
+                                    inventory[1]["type"] = food_converts
+                                    shown_info = None
+                                else:
+                                    inventory[1] = None
+                                break
+                        elif name in STORAGE_ITEMS:
+                            if storage_open is not None:
+                                storage_open = None
+                            else:
+                                open_storage(1)
 
             # === Mouse down ===
             if event.type == pygame.MOUSEBUTTONDOWN:
+                # If a storage window is open, handle simple transfers first
+                if storage_open is not None:
+                    if event.button == 1 and shown_button.collidepoint(mouse_pos):
+                        storage_open = None
+                        break
+
+                    # validate storage item still present
+                    if storage_open < len(inventory):
+                        st_item = inventory[storage_open]
+                    else:
+                        st_item = None
+                    if not st_item or st_item["type"] not in STORAGE_ITEMS:
+                        close_storage()
+                    else:
+                        st_def = STORAGE_ITEMS[st_item["type"]]
+                        slot_rects = get_storage_slot_rects(st_def)
+                        # Click on storage slot -> try to move to first empty inventory slot
+                        for si, srect in enumerate(slot_rects):
+                            if srect.collidepoint(mouse_pos) and event.button == 1:
+                                contents = st_item.setdefault("contents", [None]*st_def["slots"])
+                                if si < len(contents) and contents[si]:
+                                    for j in range(len(inventory)):
+                                        if inventory[j] is None:
+                                            inventory[j] = contents[si]
+                                            contents[si] = None
+                                            break
+                                break
+                        else:
+                            # Click on inventory to put item into storage
+                            st_def = STORAGE_ITEMS[st_item["type"]]
+                            forbidden_items = st_def["not_allowed_items"]
+                            for inv_i, inv_rect in enumerate(get_inventory_slot_rects()):
+                                if inv_rect.collidepoint(mouse_pos) and event.button == 1:
+                                    if inventory[inv_i] and inv_i != storage_open:
+                                        contents = st_item.setdefault("contents", [None]*st_def["slots"])
+                                        for k in range(len(contents)):
+                                            if contents[k] is None and inventory[inv_i]["type"] not in forbidden_items:
+                                                contents[k] = inventory[inv_i]
+                                                inventory[inv_i] = None
+                                                break
+                                    break
+                        # prevent other click handlers from running when interacting with storage
+                        continue
+
                 # GUI closed → pick/drop
                 if not (crafting_visible or crafting_structures_visible):
+                    if event.button == 1:
+                        # Handle mining/chopping when holding appropriate tool
+                        for slot in range(2):
+                            if inventory[slot] and inventory[slot]["type"] in MINING_TOOLS:
+                                # Try mining ores
+                                tile_x = int(world_mouse_x // TILE_SIZE)
+                                tile_y = int(world_mouse_y // TILE_SIZE)
+                                tile = get_current_tile(tile_x, tile_y)
+                                
+                                if tile in ["sedimentary_iron", "laterite_soil"]:
+                                    # start mining animation; effect applied at hit frame
+                                    start_tool_animation(slot, "mine", inventory[slot], tile_x=tile_x, tile_y=tile_y)
+                                    break
+                                        
+                                # Try chopping plants
+                                for plant in plants[:]:
+                                    plant_rect = pygame.Rect(
+                                        plant["x"] - PLANT_SIZE//2,
+                                        plant["y"] - PLANT_SIZE//2,
+                                        PLANT_SIZE, PLANT_SIZE
+                                    )
+                                    if plant_rect.collidepoint(world_mouse_x, world_mouse_y):
+                                        # queue a chop animation; effect will be applied at the hit moment
+                                        start_tool_animation(slot, "chop", inventory[slot], target_plant=plant)
+                                        break
                     if event.button == 1 and shown_info and shown_info[3].collidepoint(mouse_pos):
+                        # determine which hotbar slot is hovered
+                        hot_i = get_inventory_slot_rects().index(shown_info[1]) if shown_info else -1
                         name = shown_info[0]
-                        if name in FOOD_STATS:
+                        # storage open (toggle now)
+                        if hot_i != -1 and inventory[hot_i] and inventory[hot_i]["type"] in STORAGE_ITEMS:
+                            if storage_open == hot_i:
+                                close_storage()
+                            else:
+                                open_storage(hot_i)
+                        # consumable handling (existing)
+                        elif name in FOOD_STATS:
                             food = FOOD_STATS[name]
                             hunger = min(MAX_HUNGER, hunger + food["hunger"])
                             thirst = max(0, min(MAX_THIRST, thirst + food["thirst"]))
@@ -1380,20 +2641,85 @@ while running:
 
                 drag_item = None
                 drag_origin = None
+# event_here
 
     if not paused:
+        past_dt = dt
+        dt = min(dt, MAX_DELTA_TIME)
         # === Movement ===
         keys = pygame.key.get_pressed()
+        # Apply acceleration based on input
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            player_x -= player_speed
+            player_x -= player_acceleration
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            player_x += player_speed
+            player_x += player_acceleration
         if keys[pygame.K_UP] or keys[pygame.K_w]:
-            player_y -= player_speed
+            player_y -= player_acceleration
         if keys[pygame.K_DOWN] or keys[pygame.K_s]:
-            player_y += player_speed
+            player_y += player_acceleration
+
+        # Clamp velocity to prevent excessive speed
+        player_vel_x = max(-MAX_VELOCITY, min(MAX_VELOCITY, player_vel_x))
+        player_vel_y = max(-MAX_VELOCITY, min(MAX_VELOCITY, player_vel_y))
+
+        # Calculate new position using clamped values
+        new_x = player_x + player_vel_x * dt
+        new_y = player_y + player_vel_y * dt
+
+        player_vel_x *= player_friction
+        player_vel_y *= player_friction
+        
+        # Check plant collisions using circles
+        player_radius = player_size / 2
+        plant_radius = PLANT_SIZE / 2
+        collided = False
+
+        for plant in plants:
+            if PLANT_STATS[plant["type"]]["can_collide"]:
+                # Get the actual radius for this plant type and growth stage
+                plant_radius = PLANT_MASKS[plant["type"]][plant["growth_stage"]]
+                player_radius = player_mask_radius
+                
+                # Calculate centers
+                plant_center_x = plant["x"] + plant_radius
+                plant_center_y = plant["y"] + plant_radius
+                player_center_x = new_x 
+                player_center_y = new_y
+
+                # Calculate distance between centers
+                dx = player_center_x - plant_center_x
+                dy = player_center_y - plant_center_y
+                distance = math.sqrt(dx * dx + dy * dy)
+
+                # Check if circles overlap using actual texture-based radii
+                if distance < (player_radius + plant_radius):
+                    # Collision detected!
+                    collided = True
+                    
+                    # Add collision response
+                    if distance > 0:  # Avoid division by zero
+                        # Calculate normalized direction vector
+                        nx = dx / distance
+                        ny = dy / distance
+                        
+                        # Calculate overlap using actual radii
+                        overlap = (player_radius + plant_radius) - distance
+                        
+                        # Push player away from collision
+                        new_x = player_center_x + nx * overlap
+                        new_y = player_center_y + ny * overlap
+
+                # Only update if no collision
+                if not collided:
+                    player_x = new_x
+                    player_y = new_y
+
+        # Only update position if no collision or after collision response
+        player_x = new_x
+        player_y = new_y
 
         # === UPDATE PLAYER STATS ===
+        dt = past_dt
         # Gradual hunger/thirst decay
         hunger -= HUNGER_DECAY * dt / 10
         thirst -= THIRST_DECAY * dt / 10
@@ -1416,7 +2742,7 @@ while running:
             health -= 5 * dt  # slow damage
         else:
             # Small passive regen if full
-            if hunger > 80 and thirst > 80:
+            if hunger > 60 and thirst > 60:
                 health += 1 * dt
         health = max(0, min(MAX_HEALTH, health))
 
@@ -1434,70 +2760,98 @@ while running:
             for structure in structures:
                 if abs(item["x"] - structure["x"]) < STRUCTURE_SIZE and \
                 abs(item["y"] - structure["y"]) < STRUCTURE_SIZE:
-                    handle_cooking(structure, item)
+                    handle_cooking(structure, item, dt)
 
-    """player_x = max(0, min(WIDTH - player_size, player_x))
-    player_y = max(0, min(HEIGHT - player_size, player_y))"""
+    if not paused:
+        update_animals(dt)
 
-    # === UPDATE PLANTS ===
-    for plant in plants:
-        tile = get_tile_at(plant["x"], plant["y"])
-        if tile in PLANT_STATS[plant["type"]]["only_tiles"]:
-            plant["growth_timer"] += dt / 60  # convert seconds to minutes
-            stats = PLANT_STATS[plant["type"]]
-            stages = stats["stages"]
+        # === UPDATE PLANTS ===
+        for plant in plants:
+            tile = get_current_tile(int(plant["x"] // TILE_SIZE), int(plant["y"] // TILE_SIZE))
+            if tile in PLANT_STATS[plant["type"]]["only_tiles"]:
+                plant["growth_timer"] += dt / 60  # convert seconds to minutes
+                stats = PLANT_STATS[plant["type"]]
+                stages = stats["stages"]
 
-            # Find the current stage index
-            current_stage_index = next((i for i, s in enumerate(stages) if s["name"] == plant["growth_stage"]), -1)
+                # Find the current stage index
+                current_stage_index = next((i for i, s in enumerate(stages) if s["name"] == plant["growth_stage"]), -1)
 
-            # Only update if we're in the stage list (not already in flowering/fruited)
-            if current_stage_index != -1:
-                current_stage = stages[current_stage_index]
-                # Check if enough time has passed to move to next stage
-                if plant["growth_timer"] >= current_stage["timer_mins"]:
-                    plant["growth_timer"] = 0  # reset timer for next stage
-                    next_index = current_stage_index + 1
+                # Only update if we're in the stage list (not already in flowering/fruited)
+                if current_stage_index != -1:
+                    current_stage = stages[current_stage_index]
+                    # Check if enough time has passed to move to next stage
+                    if plant["growth_timer"] >= current_stage["timer_mins"]:
+                        plant["growth_timer"] = 0  # reset timer for next stage
+                        next_index = current_stage_index + 1
 
-                    if next_index < len(stages):
-                        plant["growth_stage"] = stages[next_index]["name"]
-                    else:
-                        plant["growth_stage"] = stats["last_stage"]
+                        if next_index < len(stages):
+                            plant["growth_stage"] = stages[next_index]["name"]
+                        else:
+                            plant["growth_stage"] = stats["last_stage"]
 
-            # If already flowering and enough time passes, go to fruited
-            elif plant["growth_stage"] == stats["last_stage"]:
-                if plant["growth_timer"] > stats["fruit_time"]:
-                    plant["growth_stage"] = stats["last_stage_last"]
+                # If already flowering and enough time passes, go to fruited
+                elif plant["growth_stage"] == stats["last_stage"]:
+                    if plant["growth_timer"] > stats["fruit_time"]:
+                        plant["growth_stage"] = stats["last_stage_last"]
 
-    # === UPDATE ITEMS ===
-    for item in items:
-        if item["type"] in ITEM_CONVERT:
-            item["timer"] = item.get("timer", ITEM_CONVERT[item["type"]][0])
-            item["timer"] -= dt
-            if item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is not None:
-                item["type"] = ITEM_CONVERT[item["type"]][1]
-                if item["type"] in MAX_ITEM_DUR:
-                    item["dur"] = MAX_ITEM_DUR[item["type"]]
-                del item["timer"]
-            elif item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is None:
-                items.remove(item)
-                break
-        tile = get_tile_at(item["x"]//TILE_SIZE, item["y"]//TILE_SIZE)
-        if item["type"] in ITEM_TILE_INTERACTION:
-            interaction = ITEM_TILE_INTERACTION[item["type"]]
-            if tile in interaction:
-                tile_interaction = interaction[tile]
-                item_converts = tile_interaction["item_converts"]
-                if item_converts is not None:
-                    item["type"] = item_converts
+        # === UPDATE ITEMS ===
+        for item in items[:]:
+            if item["type"] in ITEM_CONVERT:
+                item["timer"] = item.get("timer", ITEM_CONVERT[item["type"]][0])
+                item["timer"] -= dt
+                if item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is not None:
+                    item["type"] = ITEM_CONVERT[item["type"]][1]
                     if item["type"] in MAX_ITEM_DUR:
                         item["dur"] = MAX_ITEM_DUR[item["type"]]
+                    del item["timer"]
+                elif item["timer"] <= 0 and ITEM_CONVERT[item["type"]][1] is None:
+                    items.remove(item)
+                    break
+            tile_x = int(item["x"] // TILE_SIZE)
+            tile_y = int(item["y"] // TILE_SIZE)
+            tile = get_current_tile(tile_x, tile_y)
+            if item["type"] in ITEM_TILE_INTERACTION:
+                interaction = ITEM_TILE_INTERACTION[item["type"]]
+                if tile in interaction:
+                    tile_interaction = interaction[tile]
+                    # item conversion (existing)
+                    item_converts = tile_interaction.get("item_converts")
+                    if item_converts is not None:
+                        item["type"] = item_converts
+                        if item["type"] in MAX_ITEM_DUR:
+                            item["dur"] = MAX_ITEM_DUR[item["type"]]
+
+                    # tile conversion (new)
+                    tile_converts = tile_interaction.get("tile_converts")
+                    if tile_converts is not None:
+                        # compute chunk + local indices (handle negatives)
+                        chunk_x = tile_x // CHUNK_SIZE
+                        chunk_y = tile_y // CHUNK_SIZE
+                        local_x = tile_x % CHUNK_SIZE
+                        local_y = tile_y % CHUNK_SIZE
+                        if local_x < 0:
+                            local_x += CHUNK_SIZE
+                            chunk_x -= 1
+                        if local_y < 0:
+                            local_y += CHUNK_SIZE
+                            chunk_y -= 1
+
+                        # ensure chunk is loaded, then set tile
+                        chunk = get_chunk(chunk_x, chunk_y)
+                        chunk[local_y][local_x] = tile_converts
+            
+            if "dur" in item and item["dur"] <= 0:
+                items.remove(item)
 
     # === HOTBAR ITEMS INFO ===
     slot_rects = get_inventory_slot_rects()
     new_info = None
     for i in range(2):
         if slot_rects[i].collidepoint(mouse_pos) and inventory[i] is not None:
-            new_info = [inventory[i]["type"], slot_rects[i], inventory[i]["type"] in FOOD_STATS, pygame.Rect(0,0,0,0)]
+            # store extra flag for storage items
+            is_food = (inventory[i]["type"] in FOOD_STATS)
+            is_storage_item = (inventory[i]["type"] in STORAGE_ITEMS)
+            new_info = [inventory[i]["type"], slot_rects[i], is_food, pygame.Rect(0,0,0,0), is_storage_item]
             break
 
     # Only clear shown_info if not hovering hotbar or info box
@@ -1514,6 +2868,8 @@ while running:
     i = get_inventory_slot_rects().index(shown_info[1]) if shown_info else -1
     if i != -1 and inventory[i] is None:
         shown_info = None
+
+    update_animations(dt)
 
     # === DRAW EVERYTHING ===
     WIN.fill(WHITE)
@@ -1573,7 +2929,20 @@ while running:
         screen_y = plant["y"] - camera_y
         stage = plant["growth_stage"]
         img = PLANT_IMAGES[plant["type"]][stage]
+        img_rect = img.get_rect(center=(screen_x, screen_y))
+        plant_radius = PLANT_MASKS[plant["type"]][plant["growth_stage"]]
+        pygame.draw.circle(WIN, (0, 0, 255), (screen_x, screen_y), 10)
+        WIN.blit(img, img_rect.topleft)
+
+    # === STRUCTURES ===
+    for structure in structures:
+        screen_x = structure["x"] - camera_x
+        screen_y = structure["y"] - camera_y
+        img = STRUCTURE_IMAGES[structure["type"]]
         WIN.blit(img, (screen_x, screen_y))
+
+    # === ANIMALS ===
+    draw_animals(camera_x, camera_y)
 
     # === PLAYER ===
     player_screen_x = WIDTH // 2 - player_size // 2
@@ -1583,15 +2952,10 @@ while running:
     player_rect = player_texture_rotated.get_rect(center=(WIDTH//2, HEIGHT//2))
     WIN.blit(player_texture_rotated, player_rect.topleft)
 
-    # === STRUCTURES ===
-    for structure in structures:
-        screen_x = structure["x"] - camera_x
-        screen_y = structure["y"] - camera_y
-        img = STRUCTURE_IMAGES[structure["type"]]
-        WIN.blit(img, (screen_x, screen_y))
+    draw_animations(camera_x, camera_y, dt)
 
     # === LIGHTING === (add this)
-    #draw_lighting(camera_x, camera_y)
+    draw_lighting(camera_x, camera_y)
 
     # === GUI (no camera offset) ===
     draw_inventory()
@@ -1604,14 +2968,21 @@ while running:
         if screen_rect.collidepoint(mouse_pos):
             info_text = font.render(item["type"], True, BLACK)
             WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] + 15))
+            timer_pos = [mouse_pos[0] + 15, mouse_pos[1] + 35]
+            cook_pos = [mouse_pos[0] + 15, mouse_pos[1] + 35]
             if "dur" in item:
                 dur_text = font.render(f"Durability: {(item['dur'] / MAX_ITEM_DUR[item['type']])*100:.2f}%", True, BLACK)
-                WIN.blit(dur_text, (mouse_pos[0] + 15, mouse_pos[1] + 35))
+                timer_pos[1] = WIN.blit(dur_text, (mouse_pos[0] + 15, mouse_pos[1] + 35)).bottom
+                cook_pos[1] = timer_pos[1]
             if "timer" in item:
                 timer_text = font.render(f"{ITEM_CONVERT_LABELS[item['type']]}{item['timer']:.1f}s", True, BLACK)
-                WIN.blit(timer_text, (mouse_pos[0] + 15, mouse_pos[1] + 55))
+                cook_pos[1] = WIN.blit(timer_text, timer_pos).bottom
+            if "cook_timer" in item:
+                timer_text = font.render(f"Cooks in: {item['cook_timer']:.1f}s", True, BLACK)
+                WIN.blit(timer_text, cook_pos)
             break
 
+    struct = False
     for structure in structures:
         screen_x = structure["x"] - camera_x
         screen_y = structure["y"] - camera_y
@@ -1620,21 +2991,54 @@ while running:
             info_text = font.render(structure["type"], True, BLACK)
             WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] - 15))
             if "timer" in structure:
-                info_text = font.render(f"Burns in: {structure['timer']}", True, BLACK)
+                info_text = font.render(f"Burns in: {structure['timer']:.1f}", True, BLACK)
                 WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] - 35))
+            struct = True
             break
+
+    if not struct:
+        for plant in plants:
+            screen_x = plant["x"] - camera_x
+            screen_y = plant["y"] - camera_y
+            screen_rect = pygame.Rect(screen_x-PLANT_SIZE//2, screen_y-PLANT_SIZE//2, PLANT_SIZE, PLANT_SIZE)
+            if screen_rect.collidepoint(mouse_pos):
+                info_text = font.render(plant["type"], True, BLACK)
+                WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] - 15))
+                info_text = font.render(plant["growth_stage"], True, BLACK)
+                WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] - 35))
+                info_text = font.render(f"Health: {plant['health']}", True, BLACK)
+                WIN.blit(info_text, (mouse_pos[0] + 15, mouse_pos[1] - 55))
+                break
 
     if crafting_structures_visible:
         draw_structure_crafting_gui()
     elif crafting_visible:
         draw_crafting_gui()
     elif shown_info is not None:
-        name, rect, is_edible, name_rect = shown_info
-        if not is_edible:
+        # unpack extended shown_info: name, rect, is_edible, button_rect, is_storage
+        name, rect, is_edible, name_rect, is_storage = shown_info
+        if not is_edible and not is_storage:
             name_text = font.render(name, True, (0, 0, 0))
             text_rect = name_text.get_rect(center=rect.center)
             text_rect.centery = rect.top-12
             shown_info[3] = WIN.blit(name_text, text_rect.topleft)
+        elif is_storage:
+            # determine which hotbar slot this info belongs to
+            try:
+                hot_i = get_inventory_slot_rects().index(rect)
+            except ValueError:
+                hot_i = -1
+            is_open = (storage_open == hot_i)
+            label = "> Close" if is_open else "> Open"
+            open_text = font.render(label, True, (100, 230, 100) if shown_button.collidepoint(mouse_pos) else (0,0,0))
+            text_rect = open_text.get_rect(center=rect.center)
+            text_rect.centery = rect.top-12
+            shown_button = WIN.blit(open_text, text_rect.topleft)
+            shown_info[3] = shown_button
+            name_text = font.render(name, True, (0,0,0))
+            text_rect = name_text.get_rect(center=rect.center)
+            text_rect.centery = rect.top-32
+            WIN.blit(name_text, text_rect.topleft)
         else:
             eat_text = font.render("> "+CONSUME_TYPES[name], True, (100, 230, 100) if shown_button.collidepoint(mouse_pos) else (0, 0, 0))
             text_rect = eat_text.get_rect(center=rect.center)
@@ -1650,6 +3054,9 @@ while running:
     if drag_item:
         WIN.blit(ITEM_IMAGES[drag_item["type"]],
                 (mouse_pos[0] - drag_offset[0] + 10, mouse_pos[1] - drag_offset[1] + 10))
+    
+    # draw storage gui on top of other GUI elements
+    draw_storage_gui()
         
     pygame.display.update()
 
